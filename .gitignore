@@ -1,0 +1,7 @@
+# Runtime-generated files (machine-specific, not shared)
+.env
+.machine-name
+.repo_sync_hint_count
+
+# Claude Code local settings
+.claude/settings.local.json
