@@ -17,64 +17,59 @@ Claude Code 多仓库同步、跨设备任务传递、模块管理工具。
 
 ## 前提条件
 
-在开始之前，请确保以下工具已安装：
-
 ### 1. Git
 
-- **Windows**: 打开 PowerShell，运行：
+- **Windows**：打开 **PowerShell**，运行：
   ```powershell
   winget install --id Git.Git -e
   ```
-- **macOS**: `brew install git`
-- **Linux**: `sudo apt install git`（Ubuntu/Debian）或 `sudo dnf install git`（Fedora）
+- **macOS**：打开终端，运行：`brew install git`
+- **Linux**：打开终端，运行：`sudo apt install git`
 
-### 2. Python 3.10 或更高版本
+### 2. Python 3.10+
 
-- **Windows**: 打开 PowerShell，运行：
+- **Windows**：继续在 **PowerShell** 中运行：
   ```powershell
   winget install --id Python.Python.3.13 -e
   ```
-  安装后重新打开终端，输入 `python --version` 确认版本号 ≥ 3.10
-- **macOS**: `brew install python`
-- **Linux**: `sudo apt install python3`
+  安装后重新打开 PowerShell，输入 `python --version` 确认版本号 >= 3.10
+- **macOS**：继续在终端中运行：`brew install python`
+- **Linux**：继续在终端中运行：`sudo apt install python3`
 
 ### 3. GitHub CLI (gh)
 
-- **Windows**:
+- **Windows**：继续在 **PowerShell** 中运行：
   ```powershell
   winget install --id GitHub.cli -e
   ```
-- **macOS**: `brew install gh`
-- **Linux**: 参考 [GitHub CLI 官方文档](https://cli.github.com/)
+- **macOS**：继续在终端中运行：`brew install gh`
+- **Linux**：参考 [GitHub CLI 官方文档](https://cli.github.com/)
 
-安装后需要登录：
+安装完成后，继续在同一个终端中运行：
 
 ```bash
 gh auth login
 ```
 
-按提示选择 GitHub.com → HTTPS → Login with a web browser，然后在浏览器中完成授权。
+按提示选择：GitHub.com → HTTPS → Login with a web browser，然后在浏览器中完成授权。
 
 ### 4. Claude Code
 
-需要已安装并可正常使用的 Claude Code CLI。如果你还没有安装，请参考 [Claude Code 官方文档](https://docs.anthropic.com/en/docs/claude-code)
+需要已安装并可正常使用的 Claude Code CLI。如果还没安装，请参考 [Claude Code 官方文档](https://docs.anthropic.com/en/docs/claude-code)。
 
 ## 快速开始
 
 ### 第 1 步：克隆本仓库
 
-打开终端（Windows 用户打开 **Git Bash** 或 **PowerShell**），运行：
+打开终端（Windows 用 **PowerShell** 或 **Git Bash**，macOS/Linux 用普通终端），运行：
 
 ```bash
 git clone https://github.com/LtxPoi/CC_Sync.git
-cd CC_Sync
 ```
 
 ### 第 2 步：给你的 GitHub 仓库添加标签
 
-CC_Sync 通过 GitHub topic 来发现你想同步的仓库。默认标签是 `claude-code-workspace`。
-
-对每个你想同步的仓库，运行：
+继续在同一个终端中，对每个想同步的仓库运行：
 
 ```bash
 gh repo edit <你的用户名>/<仓库名> --add-topic claude-code-workspace
@@ -82,99 +77,100 @@ gh repo edit <你的用户名>/<仓库名> --add-topic claude-code-workspace
 
 > 不知道用户名？运行 `gh api user -q .login` 查看。
 
-### 第 3 步：首次配置（重要！必须在交互式终端中运行）
+### 第 3 步：首次配置
 
-> ⚠️ **这一步必须在交互式终端中运行**（不是在 Claude Code 里）。Windows 用户请打开 **Git Bash**，macOS/Linux 用户打开普通终端。
+> ⚠️ **这一步必须在交互式终端中运行**（不是在 Claude Code 里）。Windows 用户请打开 **Git Bash**，macOS/Linux 用户用普通终端。
 
-在 CC_Sync 目录下运行：
+在终端中进入 CC_Sync 目录并运行：
 
 ```bash
+cd CC_Sync
 bash sync.sh
 ```
 
-首次运行会启动配置向导，会依次询问：
+首次运行会启动配置向导，依次询问：
 
 **问题 1：dotfiles 仓库路径**
 
-```
-【第 1 步】请指定 dotfiles 仓库的存放路径
-路径：
-```
+输入你想用来存放 Claude Code 配置文件的 git 仓库路径。如果还没有，填一个新路径（脚本会自动创建）。
 
-输入你想用来存放配置文件的 git 仓库路径。如果你还没有 dotfiles 仓库，可以填一个新路径（脚本会自动创建）。例如：
+示例：
 - Windows: `C:/dotfiles` 或 `D:/config/dotfiles`
 - macOS/Linux: `~/dotfiles`
 
-**问题 2：是否启用仓库同步**
-
-```
-【第 2 步】是否启用项目仓库批量同步？
-是否启用？(y/n)：
-```
+**问题 2：是否启用仓库同步？**
 
 输入 `y` 启用。启用后会继续询问：
 
-**问题 2a：仓库存放路径**
-
-```
-你的项目仓库存放在电脑上的哪个文件夹？
-请输入路径：
-```
-
-输入你平时存放代码仓库的目录。多个目录用英文分号 `;` 分隔，例如：`D:/Projects;E:/Work`
-
-**问题 2b：GitHub topic 标签**
-
-```
-请输入标签名（回车使用默认值 claude-code-workspace）：
-```
-
-直接按回车使用默认值即可。
+- **仓库存放路径**：输入你平时存代码的目录，多个用 `;` 分隔（如 `D:/Projects;E:/Work`）
+- **GitHub topic 标签**：直接按回车使用默认值 `claude-code-workspace`
 
 配置完成后，脚本会立即执行一次完整同步。
 
-### 第 4 步：日常使用
+### 第 4 步：日常使用（在 Claude Code 中）
 
-配置完成后，以后只需要：
+配置完成后，以后的日常同步全部在 **Claude Code** 中完成：
 
 1. 在 Claude Code 中打开 CC_Sync 目录
-2. 输入 `/sync` 或用自然语言说“同步”
+2. 输入  或直接说“同步”“推一下”“pull 所有仓库”等
 
-Claude 会自动执行同步、处理冲突、报告结果。
+Claude 会自动完成同步、处理冲突、报告结果、执行跨设备任务。
+
+> 其他功能（设备管理、模块管理等）也是在 Claude Code 中用自然语言说就行，不需要手动敲命令。
 
 ## 使用方法
 
+以下所有操作均在 **Claude Code** 中完成，用自然语言或斜杠命令即可。
+
 ### 同步
 
-| 命令 | 说明 |
-|------|------|
-| `bash sync.sh` | 执行完整同步（6 步：发现→配置→pull→汇总→handoff→dotfiles） |
+在 Claude Code 中说：
+
+- “同步” 或 “pull 所有仓库” 或 “推一下”
+- 或输入 `/sync`
+
+Claude 会自动运行 sync.sh、处理冲突、展示汇总结果。
 
 ### 设备管理
 
-| 命令 | 说明 |
-|------|------|
-| `bash sync.sh device list` | 查看已注册的设备 |
-| `bash sync.sh device add <名称>` | 注册新设备（名称必须唯一） |
-| `bash sync.sh device remove <名称>` | 移除设备 |
+在 Claude Code 中说：
+
+- “查看设备列表”
+- “注册新设备 xxx”
+- “移除设备 xxx”
 
 ### 仓库同步管理
 
-| 命令 | 说明 |
-|------|------|
-| `bash sync.sh repo-sync enable` | 开启仓库同步（首次配置时选了 no 的话） |
-| `bash sync.sh repo-sync unignore <名称>` | 恢复之前忽略的仓库 |
+- “开启仓库同步” — 如果首次配置时选了 no
+- “恢复之前忽略的 xxx 仓库”
 
 ### 模块管理
 
+- “查看已安装的模块”
+- “检查更新”
+- “更新所有模块”
+- “安装 anthropics/skills 里的 pdf skill”
+- “删除 xxx 模块”
+- “新设备恢复所有模块”
+
+### 命令行参考（高级用户）
+
+如果你喜欢直接在终端中操作，以下是完整命令参考：
+
 | 命令 | 说明 |
 |------|------|
-| `bash module-manager.sh list` | 查看已安装的模块 |
-| `bash module-manager.sh check --all` | 检查所有模块是否有更新 |
-| `bash module-manager.sh update --all` | 更新所有模块 |
-| `bash module-manager.sh install <source>` | 安装新模块（如 `anthropics/skills:skills/pdf`） |
+| `bash sync.sh` | 完整同步 |
+| `bash sync.sh device list` | 查看设备 |
+| `bash sync.sh device add <名称>` | 注册设备 |
+| `bash sync.sh device remove <名称>` | 移除设备 |
+| `bash sync.sh repo-sync enable` | 开启仓库同步 |
+| `bash sync.sh repo-sync unignore <名称>` | 恢复忽略的仓库 |
+| `bash module-manager.sh list` | 查看模块 |
+| `bash module-manager.sh check --all` | 检查更新 |
+| `bash module-manager.sh update --all` | 更新所有 |
+| `bash module-manager.sh install <source>` | 安装模块 |
 | `bash module-manager.sh remove <名称>` | 删除模块 |
-| `bash module-manager.sh restore` | 新设备一键恢复所有模块 |
+| `bash module-manager.sh restore` | 新设备恢复 |
 
 ## 配置说明
 
@@ -191,51 +187,46 @@ Claude 会自动执行同步、处理冲突、报告结果。
 
 ```
 CC_Sync/
-├── sync.sh                  # 主脚本：仓库发现、配置同步、pull/push、handoff
-├── module-manager.sh        # 第三方模块管理
+├── sync.sh                  # 主脚本
+├── module-manager.sh        # 模块管理
 ├── lib/
-│   ├── common.sh            # 共享 bash 工具函数
+│   ├── common.sh            # 共享 bash 工具
 │   ├── handoff.py           # HANDOFF.md 解析/写入
-│   └── module_helper.py     # module-manager 的 Python helper
+│   └── module_helper.py     # 模块管理 Python helper
 ├── HANDOFF.md               # 跨设备任务传递
 ├── CLAUDE.md                # Claude Code 项目级指令
 ├── .env                     # 本机配置（自动生成，不提交）
-├── .sync_ignore             # 永久忽略的仓库列表（跨设备共享）
-├── .gitignore
-├── LICENSE
+├── .sync_ignore             # 永久忽略的仓库列表
 └── .claude/
-    ├── skills/
-    │   ├── sync/SKILL.md        # /sync 技能定义
-    │   └── module-manager/SKILL.md  # /module-manager 技能定义
-    └── hooks/
-        └── preflight.py         # 会话启动检查
+    ├── skills/              # 技能定义（/sync、/module-manager）
+    └── hooks/               # 会话启动检查
 ```
 
 ## 常见问题
 
 ### sync.sh 报错“请在终端中运行”
 
-原因：`.env` 配置文件不存在。首次使用必须在交互式终端（Git Bash 或普通终端）中运行 `bash sync.sh` 完成配置向导。Claude Code 的 bash 工具是非交互的，无法完成向导。
+`.env` 不存在。请在交互式终端（Git Bash / 普通终端）中运行 `bash sync.sh` 完成首次配置。Claude Code 的 bash 工具是非交互的，无法运行向导。
 
 ### gh CLI 连接超时
 
-gh CLI 不走系统代理。如果你在受限网络环境下，需要手动设置代理：
+gh CLI 不走系统代理。在受限网络环境下，需要在终端中手动设置：
 
 ```bash
-export HTTPS_PROXY=http://127.0.0.1:端口号
+export HTTPS_PROXY=http://127.0.0.1:<端口号>
 ```
 
 ### git diff 显示大量改动但内容没变
 
-这是 Windows 上的 CRLF 幻影改动（行尾符 LF vs CRLF 差异），不是真正的内容变更。用 `git diff --stat` 确认是否有实质改动。
+Windows 上的 CRLF 幻影改动（行尾符差异），不是真正的内容变更。
 
-### 新设备怎么恢复环境
+### 新设备怎么恢复
 
-1. 克隆 CC_Sync 仓库
-2. 在交互式终端运行 `bash sync.sh` 完成首次配置
-3. 注册设备：`bash sync.sh device add <设备名>`
-4. 运行一次 `/sync` 拉取所有配置和代码
-5. 恢复模块：`bash module-manager.sh restore`
+1. 在终端中克隆：`git clone https://github.com/LtxPoi/CC_Sync.git`
+2. 在终端中进入目录并运行：`cd CC_Sync && bash sync.sh`（完成向导）
+3. 在 Claude Code 中打开 CC_Sync 目录，说“注册新设备 xxx”
+4. 说“同步”拉取所有配置和代码
+5. 说“恢复所有模块”
 
 ## 作者
 
