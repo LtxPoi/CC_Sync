@@ -23,8 +23,8 @@ Multi-repo sync, cross-device task handoff, and module management for Claude Cod
   ```powershell
   winget install --id Git.Git -e
   ```
-- **macOS**: Open terminal and run: `brew install git`
-- **Linux**: Open terminal and run: `sudo apt install git`
+- **macOS**: Open **Terminal** and run: `brew install git`
+- **Linux**: Open **Terminal** and run: `sudo apt install git`
 
 ### 2. Python 3.10+
 
@@ -33,8 +33,8 @@ Multi-repo sync, cross-device task handoff, and module management for Claude Cod
   winget install --id Python.Python.3.13 -e
   ```
   Restart PowerShell, then verify: `python --version`
-- **macOS**: Continue in terminal: `brew install python`
-- **Linux**: Continue in terminal: `sudo apt install python3`
+- **macOS**: Continue in **Terminal**: `brew install python`
+- **Linux**: Continue in **Terminal**: `sudo apt install python3`
 
 ### 3. GitHub CLI (gh)
 
@@ -42,10 +42,10 @@ Multi-repo sync, cross-device task handoff, and module management for Claude Cod
   ```powershell
   winget install --id GitHub.cli -e
   ```
-- **macOS**: Continue in terminal: `brew install gh`
+- **macOS**: Continue in **Terminal**: `brew install gh`
 - **Linux**: See [GitHub CLI docs](https://cli.github.com/)
 
-Then authenticate (continue in the same terminal):
+After installing, continue in the same **PowerShell** (or **Terminal**) and run:
 
 ```bash
 gh auth login
@@ -61,7 +61,7 @@ You need a working Claude Code CLI. See [Claude Code docs](https://docs.anthropi
 
 ### Step 1: Clone This Repo
 
-Open a terminal (Windows: **PowerShell** or **Git Bash**; macOS/Linux: regular terminal):
+Open a terminal (Windows: **PowerShell** or **Git Bash**; macOS/Linux: **Terminal**):
 
 ```bash
 git clone https://github.com/LtxPoi/CC_Sync.git
@@ -75,74 +75,70 @@ Continue in the same terminal. For each repo you want to sync:
 gh repo edit <your-username>/<repo-name> --add-topic claude-code-workspace
 ```
 
-> Don't know your username? Run `gh api user -q .login`.
+> Don't know your username? Continue in the same terminal: `gh api user -q .login`
 
 ### Step 3: First-Time Setup (Interactive Terminal Required!)
 
-> **This step MUST run in an interactive terminal** (not inside Claude Code). Windows: open **Git Bash**. macOS/Linux: regular terminal.
+> **This step MUST run in an interactive terminal** (not inside Claude Code). Windows: open **Git Bash**. macOS/Linux: use **Terminal**.
 
-Enter the CC_Sync directory and run:
+Continue in the terminal, enter the CC_Sync directory and run:
 
 ```bash
 cd CC_Sync
 bash sync.sh
 ```
 
-The wizard will ask:
+The wizard asks:
 
-**Question 1: Dotfiles repo path**
+**Q1: Dotfiles repo path** — Enter a path for storing Claude Code config as a git repo. Examples: `C:/dotfiles` (Windows), `~/dotfiles` (macOS/Linux)
 
-Enter a path for storing Claude Code config as a git repo. If you don't have one, enter a new path (the script creates it).
-
-Examples:
-- Windows: `C:/dotfiles` or `D:/config/dotfiles`
-- macOS/Linux: `~/dotfiles`
-
-**Question 2: Enable repo sync?**
-
-Type `y` to enable. Then:
-
-- **Repo directory**: Where your code repos live. Multiple paths separated by `;` (e.g., `D:/Projects;E:/Work`)
+**Q2: Enable repo sync?** — Type `y` to enable. Then:
+- **Repo directory**: Where your repos live. Multiple paths with `;` (e.g., `D:/Projects;E:/Work`)
 - **GitHub topic**: Press Enter for the default (`claude-code-workspace`)
 
 After setup, the script runs a full sync immediately.
 
-### Step 4: Daily Use (In Claude Code)
+## Daily Use (In Claude Code)
 
-From now on, all syncing happens in **Claude Code**:
+From now on, **everything happens in Claude Code**:
 
-1. Open the CC_Sync directory in Claude Code
-2. Type `/sync` or just say "sync", "pull all repos", "push everything", etc.
+### Getting Started
 
-Claude handles syncing, conflict resolution, reporting, and cross-device tasks automatically.
+1. Open **Claude Code**
+2. Navigate to the CC_Sync directory (use `cd` if needed)
 
-> Other features (device management, module management) also work via natural language in Claude Code.
+### Syncing
 
-## Usage
+Say to Claude:
 
-All operations below are done in **Claude Code** using natural language or slash commands.
+- "sync"
+- "push everything"
+- "pull all repos"
+- "check repo status"
 
-### Sync
+Or type: `/sync`
 
-In Claude Code, say:
+Claude automatically:
 
-- "sync" or "pull all repos" or "push everything"
-- Or type `/sync`
+- Shows sync summary (which repos succeeded, failed, or unchanged)
+- Asks you to resolve config conflicts via multiple-choice
+- Offers clone options for newly discovered repos
+- Executes cross-device tasks (HANDOFF)
+- Analyzes and suggests fixes for merge conflicts
 
-Claude runs sync.sh, handles conflicts, and shows results.
+You only make decisions when Claude asks. Everything else is automatic.
 
 ### Device Management
 
+Say to Claude:
+
 - "list devices"
-- "register new device xxx"
-- "remove device xxx"
-
-### Repo Sync Management
-
-- "enable repo sync" (if you chose no during setup)
-- "restore ignored repo xxx"
+- "register new device MyLaptop" (pick a unique name)
+- "remove device OldPC"
 
 ### Module Management
+
+Say to Claude:
 
 - "list installed modules"
 - "check for updates"
@@ -151,9 +147,17 @@ Claude runs sync.sh, handles conflicts, and shows results.
 - "remove module xxx"
 - "restore all modules" (new device setup)
 
-### CLI Reference (Advanced)
+### Cross-Device Tasks (HANDOFF)
 
-For direct terminal use:
+When you need device B to do something, say to Claude on device A:
+
+- "leave a task for MyDesktop: install xxx"
+
+Next time you run /sync on device B, Claude will automatically pick up and execute the task.
+
+## CLI Reference (Advanced)
+
+For direct terminal use (**Git Bash** or **Terminal**):
 
 | Command | Description |
 |---------|-------------|
@@ -198,18 +202,17 @@ CC_Sync/
 └── .claude/
     ├── skills/              # Skill definitions (/sync, /module-manager)
     └── hooks/               # Session startup checks
-
 ```
 
 ## FAQ
 
 ### sync.sh says "please run in terminal"
 
-`.env` doesn't exist. Run `bash sync.sh` once in an interactive terminal (Git Bash / regular terminal) to complete setup. Claude Code's bash tool is non-interactive and cannot run the wizard.
+`.env` doesn't exist. Run `bash sync.sh` once in an interactive terminal (**Git Bash** or **Terminal**) to complete setup. Claude Code's bash tool is non-interactive and cannot run the wizard.
 
 ### gh CLI connection timeout
 
-gh CLI ignores system proxy. Set it manually in your terminal:
+gh CLI ignores system proxy. Set it manually in your terminal (**Git Bash** or **Terminal**):
 
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:<port>
@@ -221,11 +224,11 @@ CRLF phantom diff on Windows (LF vs CRLF). Not real content changes.
 
 ### Setting up a new device
 
-1. In terminal: `git clone https://github.com/LtxPoi/CC_Sync.git`
-2. Continue in terminal: `cd CC_Sync && bash sync.sh` (complete wizard)
-3. In Claude Code: "register new device xxx"
-4. In Claude Code: "sync" to pull all configs and code
-5. In Claude Code: "restore all modules"
+1. In **PowerShell** or **Git Bash**: `git clone https://github.com/LtxPoi/CC_Sync.git`
+2. Continue in **Git Bash**: `cd CC_Sync && bash sync.sh` (complete wizard)
+3. Open **Claude Code**, navigate to CC_Sync, say "register new device xxx"
+4. Continue in **Claude Code**: say "sync" to pull all configs and code
+5. Continue in **Claude Code**: say "restore all modules"
 
 ## Author
 

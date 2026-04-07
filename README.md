@@ -23,8 +23,8 @@ Claude Code 多仓库同步、跨设备任务传递、模块管理工具。
   ```powershell
   winget install --id Git.Git -e
   ```
-- **macOS**：打开终端，运行：`brew install git`
-- **Linux**：打开终端，运行：`sudo apt install git`
+- **macOS**：打开终端（**Terminal**），运行：`brew install git`
+- **Linux**：打开终端（**Terminal**），运行：`sudo apt install git`
 
 ### 2. Python 3.10+
 
@@ -33,8 +33,8 @@ Claude Code 多仓库同步、跨设备任务传递、模块管理工具。
   winget install --id Python.Python.3.13 -e
   ```
   安装后重新打开 PowerShell，输入 `python --version` 确认版本号 >= 3.10
-- **macOS**：继续在终端中运行：`brew install python`
-- **Linux**：继续在终端中运行：`sudo apt install python3`
+- **macOS**：继续在 **Terminal** 中运行：`brew install python`
+- **Linux**：继续在 **Terminal** 中运行：`sudo apt install python3`
 
 ### 3. GitHub CLI (gh)
 
@@ -42,10 +42,10 @@ Claude Code 多仓库同步、跨设备任务传递、模块管理工具。
   ```powershell
   winget install --id GitHub.cli -e
   ```
-- **macOS**：继续在终端中运行：`brew install gh`
+- **macOS**：继续在 **Terminal** 中运行：`brew install gh`
 - **Linux**：参考 [GitHub CLI 官方文档](https://cli.github.com/)
 
-安装完成后，继续在同一个终端中运行：
+安装完成后，继续在同一个 **PowerShell**（或 **Terminal**）中运行：
 
 ```bash
 gh auth login
@@ -61,7 +61,7 @@ gh auth login
 
 ### 第 1 步：克隆本仓库
 
-打开终端（Windows 用 **PowerShell** 或 **Git Bash**，macOS/Linux 用普通终端），运行：
+打开终端（Windows 用 **PowerShell** 或 **Git Bash**，macOS/Linux 用 **Terminal**），运行：
 
 ```bash
 git clone https://github.com/LtxPoi/CC_Sync.git
@@ -75,11 +75,11 @@ git clone https://github.com/LtxPoi/CC_Sync.git
 gh repo edit <你的用户名>/<仓库名> --add-topic claude-code-workspace
 ```
 
-> 不知道用户名？运行 `gh api user -q .login` 查看。
+> 不知道用户名？继续在同一个终端中运行 `gh api user -q .login` 查看。
 
 ### 第 3 步：首次配置
 
-> ⚠️ **这一步必须在交互式终端中运行**（不是在 Claude Code 里）。Windows 用户请打开 **Git Bash**，macOS/Linux 用户用普通终端。
+> ⚠️ **这一步必须在交互式终端中运行**（不是在 Claude Code 里）。Windows 用户请打开 **Git Bash**，macOS/Linux 用户用 **Terminal**。
 
 在终端中进入 CC_Sync 目录并运行：
 
@@ -107,44 +107,47 @@ bash sync.sh
 
 配置完成后，脚本会立即执行一次完整同步。
 
-### 第 4 步：日常使用（在 Claude Code 中）
+## 日常使用（在 Claude Code 中）
 
-配置完成后，以后的日常同步全部在 **Claude Code** 中完成：
+配置完成后，以后的所有操作都在 **Claude Code** 中完成。
 
-1. 在 Claude Code 中打开 CC_Sync 目录
-2. 输入  或直接说“同步”“推一下”“pull 所有仓库”等
+### 启动方式
 
-Claude 会自动完成同步、处理冲突、报告结果、执行跨设备任务。
+1. 打开 Claude Code
+2. 进入 CC_Sync 目录（如果 CC 不在这个目录，用 `cd` 切换）
 
-> 其他功能（设备管理、模块管理等）也是在 Claude Code 中用自然语言说就行，不需要手动敲命令。
+### 同步仓库
 
-## 使用方法
+直接对 Claude 说：
 
-以下所有操作均在 **Claude Code** 中完成，用自然语言或斜杠命令即可。
+- “同步”
+- “推一下”
+- “pull 所有仓库”
+- “检查一下各个项目的状态”
 
-### 同步
+或者输入：`/sync`
 
-在 Claude Code 中说：
+Claude 会自动执行同步脚本，然后：
 
-- “同步” 或 “pull 所有仓库” 或 “推一下”
-- 或输入 `/sync`
+- 展示同步结果汇总（哪些成功、哪些失败、哪些无变化）
+- 如果有配置文件冲突，会用选择题问你“保留哪个版本”
+- 如果有新仓库，会问你“克隆到哪个目录”
+- 如果有跨设备任务（HANDOFF），会自动执行或提示你手动完成
+- 如果某个仓库 pull 冲突，会分析差异并建议解决方案
 
-Claude 会自动运行 sync.sh、处理冲突、展示汇总结果。
+你只需要在 Claude 提问时做决定，其余全自动。
 
 ### 设备管理
 
-在 Claude Code 中说：
+对 Claude 说：
 
 - “查看设备列表”
-- “注册新设备 xxx”
-- “移除设备 xxx”
-
-### 仓库同步管理
-
-- “开启仓库同步” — 如果首次配置时选了 no
-- “恢复之前忽略的 xxx 仓库”
+- “注册新设备 MyLaptop”（名称你自己取，必须唯一）
+- “移除设备 OldPC”
 
 ### 模块管理
+
+对 Claude 说：
 
 - “查看已安装的模块”
 - “检查更新”
@@ -153,9 +156,17 @@ Claude 会自动运行 sync.sh、处理冲突、展示汇总结果。
 - “删除 xxx 模块”
 - “新设备恢复所有模块”
 
-### 命令行参考（高级用户）
+### 跨设备任务（HANDOFF）
 
-如果你喜欢直接在终端中操作，以下是完整命令参考：
+当你在 A 设备上需要 B 设备做某件事时，对 Claude 说：
+
+- “给 MyDesktop 留个任务：装一下 xxx”
+
+下次在 B 设备运行 /sync 时，Claude 会自动提示并执行待办任务。
+
+## 命令行参考（高级用户）
+
+如果你喜欢直接在终端中操作，以下是完整命令参考。在终端（**Git Bash** 或 **Terminal**）中运行：
 
 | 命令 | 说明 |
 |------|------|
@@ -206,11 +217,11 @@ CC_Sync/
 
 ### sync.sh 报错“请在终端中运行”
 
-`.env` 不存在。请在交互式终端（Git Bash / 普通终端）中运行 `bash sync.sh` 完成首次配置。Claude Code 的 bash 工具是非交互的，无法运行向导。
+`.env` 不存在。请在交互式终端（**Git Bash** 或 **Terminal**）中运行 `bash sync.sh` 完成首次配置。Claude Code 的 bash 工具是非交互的，无法运行向导。
 
 ### gh CLI 连接超时
 
-gh CLI 不走系统代理。在受限网络环境下，需要在终端中手动设置：
+gh CLI 不走系统代理。在受限网络环境下，需要在终端（**Git Bash** 或 **Terminal**）中手动设置：
 
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:<端口号>
@@ -222,11 +233,11 @@ Windows 上的 CRLF 幻影改动（行尾符差异），不是真正的内容变
 
 ### 新设备怎么恢复
 
-1. 在终端中克隆：`git clone https://github.com/LtxPoi/CC_Sync.git`
-2. 在终端中进入目录并运行：`cd CC_Sync && bash sync.sh`（完成向导）
-3. 在 Claude Code 中打开 CC_Sync 目录，说“注册新设备 xxx”
-4. 说“同步”拉取所有配置和代码
-5. 说“恢复所有模块”
+1. 在终端（**PowerShell** 或 **Git Bash**）中克隆：`git clone https://github.com/LtxPoi/CC_Sync.git`
+2. 继续在终端中进入目录并运行：`cd CC_Sync && bash sync.sh`（完成向导）
+3. 打开 **Claude Code**，进入 CC_Sync 目录，说“注册新设备 xxx”
+4. 继续在 **Claude Code** 中说“同步”拉取所有配置和代码
+5. 继续在 **Claude Code** 中说“恢复所有模块”
 
 ## 作者
 
