@@ -261,7 +261,7 @@ Windows 上的 CRLF 幻影改动（行尾符差异），不是真正的内容变
 ### 新设备怎么恢复
 
 1. 在终端（**PowerShell** 或 **Git Bash**）中克隆：`git clone https://github.com/LtxPoi/CC_Sync.git`
-2. 继续在终端中进入目录并运行：`cd CC_Sync && bash sync.sh`（完成向导）
+2. 继续在终端中进入目录并运行（路径替换为你的实际位置）：`cd /c/Projects/CC_Sync && bash sync.sh`（完成向导）
 3. 打开 **Claude Code**，进入 CC_Sync 目录，说“注册新设备 xxx”
 4. 继续在 **Claude Code** 中说“同步”拉取所有配置和代码
 5. 继续在 **Claude Code** 中说“恢复所有模块”
