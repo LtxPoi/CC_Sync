@@ -34,6 +34,7 @@ run_first_run_wizard() {
     echo "  请输入你希望存放该仓库的路径，例如："
     echo "    C:/dotfiles"
     echo "    E:/config/my-dotfiles"
+    echo "  Windows 路径不区分大小写（C:/Dotfiles 和 c:/dotfiles 等效）"
     echo ""
 
     local dotfiles_path=""
@@ -127,6 +128,7 @@ run_first_run_wizard() {
         echo "  例如："
         echo "    D:/Projects"
         echo "    E:/Work;F:/Personal（多个文件夹用英文分号 ; 隔开）"
+        echo "  Windows 路径不区分大小写（C:/Dotfiles 和 c:/dotfiles 等效）"
         echo ""
         read -p "请输入路径：" ws_roots
 
@@ -935,7 +937,7 @@ _interactive_clone_menu() {
     echo "  [s] 跳过（下次仍会询问）"
     echo "  [i] 忽略（以后不再询问）"
     echo ""
-    read -p "> " choice
+    read -p "> " choice < /dev/tty
     choice=$(echo "$choice" | tr -d '\r\n')
 
     # Handle numeric choice
@@ -961,14 +963,14 @@ _interactive_clone_menu() {
     case "$choice" in
         n|N)
             echo ""
-            read -p "$(printf '请输入完整路径（例如 D:/MyProjects 或 C:/Users/你的用户名/Documents/Code）：\n> ')" new_path
+            read -p "$(printf '请输入完整路径（例如 D:/MyProjects 或 C:/Users/你的用户名/Documents/Code）：\n> ')" new_path < /dev/tty
             new_path=$(echo "$new_path" | tr -d '\r\n')
             if [ -z "$new_path" ]; then
                 echo "路径为空，跳过"
                 return 1
             fi
             if [ ! -d "$new_path" ]; then
-                read -p "路径 $new_path 不存在，是否创建？(y/n) " create_confirm
+                read -p "路径 $new_path 不存在，是否创建？(y/n) " create_confirm < /dev/tty
                 if [[ "$create_confirm" =~ ^[Yy] ]]; then
                     mkdir -p "$new_path" || { echo -e "${RED}创建失败${NC}"; return 1; }
                 else

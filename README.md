@@ -107,6 +107,8 @@ bash sync.sh
 - Windows: `C:/dotfiles` 或 `D:/config/dotfiles`
 - macOS/Linux: `~/dotfiles`
 
+> Windows 路径不区分大小写（`C:/Dotfiles` 和 `c:/dotfiles` 等效）。
+
 **问题 2：是否启用仓库同步？**
 
 输入 `y` 启用。启用后会继续询问：

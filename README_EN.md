@@ -101,6 +101,8 @@ The wizard asks:
 
 **Q1: Dotfiles repo path** — Enter a path for storing Claude Code config as a git repo. Examples: `C:/dotfiles` (Windows), `~/dotfiles` (macOS/Linux)
 
+> Windows paths are case-insensitive (`C:/Dotfiles` and `c:/dotfiles` are equivalent).
+
 **Q2: Enable repo sync?** — Type `y` to enable. Then:
 - **Repo directory**: Where your repos live. Multiple paths with `;` (e.g., `D:/Projects;E:/Work`)
 - **GitHub topic**: Press Enter for the default (`claude-code-workspace`)
