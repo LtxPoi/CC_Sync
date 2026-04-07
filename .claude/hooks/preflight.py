@@ -1,4 +1,4 @@
-"""SessionStart hook: verify CC_General workspace environment before starting work."""
+"""SessionStart hook: verify CC_Sync workspace environment before starting work."""
 import json
 import shutil
 import sys
