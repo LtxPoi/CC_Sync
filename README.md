@@ -81,10 +81,19 @@ gh repo edit <你的用户名>/<仓库名> --add-topic claude-code-workspace
 
 > ⚠️ **这一步必须在交互式终端中运行**（不是在 Claude Code 里）。Windows 用户请打开 **Git Bash**，macOS/Linux 用户用 **Terminal**。
 
-在终端中进入 CC_Sync 目录并运行：
+在终端中进入你克隆下来的 CC_Sync 目录并运行（路径根据你实际情况修改）：
 
 ```bash
-cd CC_Sync
+# Windows 示例（请替换为你的实际路径）
+cd /c/Projects/CC_Sync
+
+# macOS/Linux 示例
+cd ~/Projects/CC_Sync
+```
+
+然后运行：
+
+```bash
 bash sync.sh
 ```
 
@@ -158,11 +167,29 @@ Claude 会自动执行同步脚本，然后：
 
 ### 跨设备任务（HANDOFF）
 
-当你在 A 设备上需要 B 设备做某件事时，对 Claude 说：
+HANDOFF 是 CC_Sync 的跨设备任务传递机制。当你在 A 设备上需要 B 设备做某件事时，可以通过它留言。
 
-- “给 MyDesktop 留个任务：装一下 xxx”
+**前提：每台设备需要先注册一个唯一名称。** 在 **Claude Code** 中说：
 
-下次在 B 设备运行 /sync 时，Claude 会自动提示并执行待办任务。
+- “注册新设备 HomeMac”
+- “注册新设备 OfficePC”
+
+> 设备名可以是任何英文名称，但必须唯一。建议用能让你一眼认出是哪台电脑的名字，比如 `HomeMac`、`OfficePC`、`MyLaptop`。
+
+**留任务：** 在 A 设备的 **Claude Code** 中说：
+
+- “给 OfficePC 留个任务：把 xxx 项目的配置文件复制过来”
+- “给 HomeMac 留个任务：运行 pip install requests”
+- “所有设备都要做：更新 gh CLI”（写入 ANY section，所有设备都会看到）
+
+**接收任务：** 在 B 设备的 **Claude Code** 中运行 /sync 时，Claude 会自动：
+
+1. 检测到待办任务
+2. 向你报告任务内容
+3. 逐条执行（命令直接运行，需要手动操作的会提示你）
+4. 完成后自动清除任务
+
+不需要手动编辑任何文件，全部通过自然语言完成。
 
 ## 命令行参考（高级用户）
 

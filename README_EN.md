@@ -81,10 +81,19 @@ gh repo edit <your-username>/<repo-name> --add-topic claude-code-workspace
 
 > **This step MUST run in an interactive terminal** (not inside Claude Code). Windows: open **Git Bash**. macOS/Linux: use **Terminal**.
 
-Continue in the terminal, enter the CC_Sync directory and run:
+In the terminal, navigate to your cloned CC_Sync directory (replace with your actual path):
 
 ```bash
-cd CC_Sync
+# Windows example (replace with your actual path)
+cd /c/Projects/CC_Sync
+
+# macOS/Linux example
+cd ~/Projects/CC_Sync
+```
+
+Then run:
+
+```bash
 bash sync.sh
 ```
 
@@ -149,11 +158,29 @@ Say to Claude:
 
 ### Cross-Device Tasks (HANDOFF)
 
-When you need device B to do something, say to Claude on device A:
+HANDOFF is CC_Sync's mechanism for relaying tasks between devices. When you need device B to do something, you can leave a message from device A.
 
-- "leave a task for MyDesktop: install xxx"
+**Prerequisite: Each device needs a unique registered name.** In **Claude Code**, say:
 
-Next time you run /sync on device B, Claude will automatically pick up and execute the task.
+- "register new device HomeMac"
+- "register new device OfficePC"
+
+> Device names can be any English name, but must be unique. Pick something that lets you instantly recognize which machine it is, like `HomeMac`, `OfficePC`, `MyLaptop`.
+
+**Leaving a task:** On device A, in **Claude Code**, say:
+
+- "leave a task for OfficePC: copy the config file from xxx project"
+- "leave a task for HomeMac: run pip install requests"
+- "task for all devices: update gh CLI" (writes to the ANY section, all devices will see it)
+
+**Receiving tasks:** When you run /sync on device B in **Claude Code**, Claude automatically:
+
+1. Detects pending tasks
+2. Reports what needs to be done
+3. Executes each task (commands run directly; manual steps are prompted)
+4. Clears completed tasks
+
+No need to manually edit any files — everything is done via natural language.
 
 ## CLI Reference (Advanced)
 
