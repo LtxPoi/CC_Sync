@@ -23,6 +23,18 @@ Multi-repo sync, cross-device handoff, and module management for Claude Code.
 - **`HANDOFF.md`**: Registry comment (`<!-- registry: ... -->`) defines valid device sections. `(none)` = no pending tasks. Only registered device names are section boundaries.
 - **`CONFIG_MAP`**: Declarative array mapping dotfiles paths to local paths. Format: `"repo_relative|local_absolute|display_name"`.
 
+## Prerequisites
+
+- Python 3.10+ (for `tomllib` in module_helper.py)
+- `gh` CLI (authenticated via `gh auth login`)
+- `git`
+
+## First Run
+
+When `.env` does not exist:
+- **Interactive terminal**: First-run wizard launches automatically
+- **Non-interactive** (Claude Code Bash tool): Exits with error. User must run `bash sync.sh` in an interactive terminal first.
+
 ## Commands
 
 ```bash
@@ -79,10 +91,17 @@ New return codes must be added to both the function and the caller dispatch.
 - `KNOWN_REPOS` is built in Step 1 and immediately available. `REPO_ORDER` is built inside Step 3's while loop. Step 2 code can only reference `KNOWN_REPOS`.
 - `WS_ROOTS` is parsed from `.env` at load time. `_find_repo_dir` depends on it.
 
+## Verification
+
+```bash
+bash -n sync.sh              # Syntax check
+bash sync.sh                 # Full run
+```
+
 ## Do NOT
 
 - Do not `source` .env with unquoted values containing semicolons or spaces
-- Do not use `((var++))` with `set -e` when var could be 0. Use `var=$((var + 1))`
+- Do not use `((var++))` in bash scripts with `set -e` when var could be 0 (evaluates to falsy, exits script). Use `var=$((var + 1))`
 - Do not place function definitions inside conditional blocks
 - Do not write files without `newline="\n"` on Windows
 - Do not assume a repo directory's remote matches the expected URL in multi-root setups
