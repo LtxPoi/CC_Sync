@@ -679,6 +679,7 @@ import sys, re
 with open(sys.argv[1], encoding='utf-8') as f:
     text = f.read()
 for m in re.findall(r'\[modules\.([^\]]+)\]', text):
+    m = m.strip('\"')
     if '.' not in m:
         print(m)
 " "$MANIFEST_PY" 2>/dev/null || true)
@@ -699,18 +700,27 @@ for m in re.findall(r'\[modules\.([^\]]+)\]', text):
         done
     fi
 
-    # dotfiles 侧：dotfiles/claude-code-config/skills/ 中的目录
+    # dotfiles 侧：dotfiles/claude-code-config/skills/ 中的目录（排除 modules.toml 管理的）
     if [ -d "$DOTFILES_SKILLS" ]; then
         for d in "$DOTFILES_SKILLS"/*/; do
             [ ! -d "$d" ] && continue
             local name
             name=$(basename "$d")
-            ALL_CUSTOM=$(printf '%s\n%s' "$ALL_CUSTOM" "$name")
+            if ! echo "$MANAGED_SKILLS" | grep -qx "$name"; then
+                ALL_CUSTOM=$(printf '%s\n%s' "$ALL_CUSTOM" "$name")
+            fi
         done
     fi
 
     # 去重排序
     ALL_CUSTOM=$(echo "$ALL_CUSTOM" | sort -u | sed '/^$/d')
+
+    # 显示已管理 skill 摘要
+    local MANAGED_COUNT=0
+    if [ -n "$MANAGED_SKILLS" ]; then
+        MANAGED_COUNT=$(echo "$MANAGED_SKILLS" | wc -l | tr -d ' ')
+    fi
+    [ "$MANAGED_COUNT" -gt 0 ] && echo "  (跳过 ${MANAGED_COUNT} 个已管理 skill，由 module-manager 管理)"
     [ -z "$ALL_CUSTOM" ] && return
 
     mkdir -p "$DOTFILES_SKILLS"
