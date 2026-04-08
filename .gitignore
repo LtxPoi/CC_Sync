@@ -3,5 +3,8 @@
 .machine-name
 .repo_sync_hint_count
 
+# Python cache
+__pycache__/
+
 # Claude Code local settings
 .claude/settings.local.json
