@@ -46,53 +46,24 @@ After any install, update, remove, or adopt operation that modifies `modules.tom
 
 When `restore` output shows some modules failed to download:
 
-```
-AskUserQuestion:
-  questions:
-    - header: "restore-fail"
-      question: "Some modules failed to restore. How to proceed?"
-      multiSelect: false
-      options:
-        - label: "Retry failed"
-          description: "Re-run restore (already-installed modules are skipped)"
-        - label: "Show errors"
-          description: "Display full error output for diagnosis"
-        - label: "Skip for now"
-          description: "Continue without these modules, fix later"
+```json
+{"questions": [{"header": "restore-fail", "question": "Some modules failed to restore. How to proceed?", "multiSelect": false, "options": [{"label": "Retry failed", "description": "Re-run restore (already-installed modules are skipped)"}, {"label": "Show errors", "description": "Display full error output for diagnosis"}, {"label": "Skip for now", "description": "Continue without these modules, fix later"}]}]}
 ```
 
 #### Remove confirmation
 
 Before executing `remove`:
 
-```
-AskUserQuestion:
-  questions:
-    - header: "remove"
-      question: "Remove module '<name>'? This deletes the directory and manifest entry."
-      multiSelect: false
-      options:
-        - label: "Yes, remove"
-          description: "Delete ~/.claude/skills/<name> and remove from modules.toml"
-        - label: "Cancel"
-          description: "Keep the module installed"
+```json
+{"questions": [{"header": "remove", "question": "Remove module '<name>'? This deletes the directory and manifest entry.", "multiSelect": false, "options": [{"label": "Yes, remove", "description": "Delete ~/.claude/skills/<name> and remove from modules.toml"}, {"label": "Cancel", "description": "Keep the module installed"}]}]}
 ```
 
 #### Untracked directory adoption
 
 When `list` shows untracked directories:
 
-```
-AskUserQuestion:
-  questions:
-    - header: "untracked"
-      question: "Found untracked directories in ~/.claude/skills/. Adopt into manifest?"
-      multiSelect: true
-      options:
-        - label: "<dir-name>"
-          description: "Track as managed module (will need source info)"
-        - label: "Skip all"
-          description: "Leave untracked for now"
+```json
+{"questions": [{"header": "untracked", "question": "Found untracked directories in ~/.claude/skills/. Adopt into manifest?", "multiSelect": true, "options": [{"label": "<dir-name>", "description": "Track as managed module (will need source info)"}, {"label": "Skip all", "description": "Leave untracked for now"}]}]}
 ```
 
 ## Core Concepts
@@ -207,6 +178,7 @@ If some modules fail (network issues), show the script’s error output verbatim
 - Confirm before install or remove operations
 - After manifest changes, remind user to run /sync to propagate to other devices
 - Script path is `module-manager.sh` relative to project root — execute as-is, do not rewrite paths
+- Managed modules must NOT be stored as file copies in dotfiles/skills/. Only modules.toml (the manifest) is synced via dotfiles; actual module files are installed by `restore` on each device.
 
 ## Experience Log
 

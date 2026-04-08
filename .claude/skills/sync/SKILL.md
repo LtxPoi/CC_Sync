@@ -29,12 +29,12 @@ When output contains a structured conflict block:
 ```
 ===CONFLICT_BEGIN===
 LABEL: settings.json
-REPO: /c/dotfiles/claude-code-config/settings.json
+REPO: /c/dotfiles/claude/settings.json
 LOCAL: /c/Users/user/.claude/settings.json
 REPO_TIME: 2025-04-07 14:32
 LOCAL_TIME: 2025-04-08 09:15
 DIFF:
-        --- /c/dotfiles/claude-code-config/settings.json
+        --- /c/dotfiles/claude/settings.json
         +++ /c/Users/user/.claude/settings.json
         @@ -3,2 +3,2 @@
         -  "theme": "dark"
@@ -44,21 +44,8 @@ DIFF:
 
 Parse each field from the block, then call AskUserQuestion:
 
-```
-AskUserQuestion:
-  questions:
-    - header: "settings"
-      question: "Config file settings.json has a conflict. Which version to keep?"
-      multiSelect: false
-      options:
-        - label: "Repo version"
-          description: "Use dotfiles repo copy (REPO_TIME from block)"
-          preview: (DIFF lines from block, strip 8-space indent)
-        - label: "Local version"
-          description: "Use local machine copy (LOCAL_TIME from block)"
-          preview: (same DIFF content)
-        - label: "Skip"
-          description: "Keep both as-is, resolve manually later"
+```json
+{"questions": [{"header": "settings", "question": "Config file settings.json has a conflict. Which version to keep?", "multiSelect": false, "options": [{"label": "Repo version", "description": "Use dotfiles repo copy (REPO_TIME from block)", "preview": "(DIFF lines from block, strip 8-space indent)"}, {"label": "Local version", "description": "Use local machine copy (LOCAL_TIME from block)", "preview": "(same DIFF content)"}, {"label": "Skip", "description": "Keep both as-is, resolve manually later"}]}]}
 ```
 
 Field mapping:
@@ -73,26 +60,15 @@ When output contains: `NEW_REPO: my-project | https://github.com/user/my-project
 
 Read `WORKSPACE_ROOTS` from `.env` (semicolon-separated paths) to build options:
 
-```
-AskUserQuestion:
-  questions:
-    - header: "my-project"
-      question: "New repo my-project not found locally. Clone to which directory?"
-      multiSelect: false
-      options:
-        - label: "C:/Claude_code_cli"
-          description: "Clone to workspace root C:/Claude_code_cli/my-project"
-        - label: "Skip"
-          description: "Do nothing now, will ask again on next sync"
-        - label: "Ignore permanently"
-          description: "Add to .sync_ignore, never ask again"
+```json
+{"questions": [{"header": "my-project", "question": "New repo my-project not found locally. Clone to which directory?", "multiSelect": false, "options": [{"label": "C:/Claude_code_cli", "description": "Clone to workspace root C:/Claude_code_cli/my-project"}, {"label": "Skip", "description": "Do nothing now, will ask again on next sync"}, {"label": "Ignore permanently", "description": "Add to .sync_ignore, never ask again"}]}]}
 ```
 
 Adapt options count to actual WORKSPACE_ROOTS entries (max 4 options total including Skip/Ignore).
 
 ### Commit message rule
 
-Script-automated commits use mechanical messages. Claude-intervened commits (conflict resolution, handoff) use descriptive commit messages.
+Script-automated commits use mechanical messages. Claude-intervened commits (conflict resolution, handoff) use descriptive Chinese messages.
 
 ## Workflow
 
@@ -145,8 +121,8 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 **If script partially failed (exit code 1):**
 - Display `[4/6]` summary verbatim first, then explain failures
 - Handle each failed repo:
-  - **pull failed (merge conflict)**: Read conflicts, analyze both sides, explain and suggest resolution. Commit with descriptive message, push
-  - **commit failed**: Diagnose, fix, recommit with descriptive message, push
+  - **pull failed (merge conflict)**: Read conflicts, analyze both sides, explain and suggest resolution. Commit with descriptive Chinese message, push
+  - **commit failed**: Diagnose, fix, recommit with descriptive Chinese message, push
   - **push failed**: `pull --rebase` then push. If rebase conflicts, follow merge flow
   - **clone failed**: Check network/permissions, report to user
 
