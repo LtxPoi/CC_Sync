@@ -1,12 +1,99 @@
 ---
 name: module-manager
-description: "Manage third-party Claude Code modules (skills, plugins, MCP servers) — install, update, remove, restore, and track via modules.toml. Triggers: managing modules, install/update/remove skill, list installed modules, sync skills across devices, new machine setup. Also: 模块管理, 安装/更新/删除/恢复技能, 检查更新, 纳管, 新设备恢复."
+description: "Manages third-party Claude Code modules (skills, plugins, MCP servers) — install, update, remove, restore, and track via modules.toml. Triggers: managing modules, install/update/remove skill, list installed modules, sync skills across devices, new machine setup. Also: 模块管理, 安装/更新/删除/恢复技能, 检查更新, 纳管, 新设备恢复."
 ---
 
 # Module Manager — Third-Party Module Management
 
 Manages all externally-sourced modules (skills / plugins / MCP servers) under `~/.claude/skills/`.
 Does not manage user-authored skills in project `.claude/skills/` directories.
+
+## Not For
+
+- User-authored skills in project `.claude/skills/` directories (those are manually managed)
+- Claude settings or configuration (use `claude config` or `/update-config`)
+- Plugins (managed by `claude plugin` command, not this skill)
+- MCP server configuration in settings.json (this skill manages module *files*, not config entries)
+
+## Critical Rules
+
+### Always confirm source format before install
+
+When user says something vague like "install the pdf skill", do NOT guess the full `owner/repo:path` source.
+
+**WRONG** (never do this):
+- Running `bash module-manager.sh install anthropics/skills:skills/pdf` based on a guess
+- Assuming `owner/repo` when user only said a skill name
+- Silently choosing between repo-subdirectory vs. entire-repo format
+
+**RIGHT**: Confirm the exact source with the user before calling the script.
+
+### Show all script output verbatim
+
+**WRONG**:
+- Reformatting the `list` table into markdown
+- Summarizing "3 modules updated successfully" instead of showing actual output
+
+**RIGHT**: Display script stdout/stderr as-is. Let the user read the original output.
+
+### Remind user to /sync after manifest changes
+
+After any install, update, remove, or adopt operation that modifies `modules.toml`, remind the user to run `/sync` to propagate the manifest to other devices.
+
+### AskUserQuestion examples
+
+#### Restore failure — partial recovery
+
+When `restore` output shows some modules failed to download:
+
+```
+AskUserQuestion:
+  questions:
+    - header: "restore-fail"
+      question: "Some modules failed to restore. How to proceed?"
+      multiSelect: false
+      options:
+        - label: "Retry failed"
+          description: "Re-run restore (already-installed modules are skipped)"
+        - label: "Show errors"
+          description: "Display full error output for diagnosis"
+        - label: "Skip for now"
+          description: "Continue without these modules, fix later"
+```
+
+#### Remove confirmation
+
+Before executing `remove`:
+
+```
+AskUserQuestion:
+  questions:
+    - header: "remove"
+      question: "Remove module '<name>'? This deletes the directory and manifest entry."
+      multiSelect: false
+      options:
+        - label: "Yes, remove"
+          description: "Delete ~/.claude/skills/<name> and remove from modules.toml"
+        - label: "Cancel"
+          description: "Keep the module installed"
+```
+
+#### Untracked directory adoption
+
+When `list` shows untracked directories:
+
+```
+AskUserQuestion:
+  questions:
+    - header: "untracked"
+      question: "Found untracked directories in ~/.claude/skills/. Adopt into manifest?"
+      multiSelect: true
+      options:
+        - label: "<dir-name>"
+          description: "Track as managed module (will need source info)"
+        - label: "Skip all"
+          description: "Leave untracked for now"
+```
 
 ## Core Concepts
 
