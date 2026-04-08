@@ -32,8 +32,15 @@ Multi-repo sync, cross-device handoff, and module management for Claude Code.
 ## First Run
 
 When `.env` does not exist:
-- **Interactive terminal**: First-run wizard launches automatically
+- **Interactive terminal**: First-run wizard launches automatically. It prompts for: dotfiles repo path, whether to enable repo sync, and workspace root directories.
 - **Non-interactive** (Claude Code Bash tool): Exits with error. User must run `bash sync.sh` in an interactive terminal first.
+
+Example `.env` (created by wizard):
+```
+DOTFILES_PATH=/c/Claude_code_cli/dotfiles
+ENABLE_REPO_SYNC=true
+WORKSPACE_ROOTS=/c/Claude_code_cli
+```
 
 ## Commands
 
