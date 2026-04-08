@@ -8,6 +8,92 @@ user_invocable: true
 
 > This skill’s output parsing logic is based on the current sync.sh version. If sync.sh output format changes, update this file accordingly.
 
+## Critical Rules
+
+### AskUserQuestion is MANDATORY for interactive decisions
+
+When sync.sh output contains `===CONFLICT_BEGIN===` blocks or `NEW_REPO:` markers, you MUST call the AskUserQuestion tool with structured options. This is non-negotiable.
+
+**WRONG** (never do this):
+- Printing conflict details as text and asking "你想保留哪个版本？" in conversation
+- Silently skipping conflicts or choosing "skip" as default
+- Summarizing "发现 2 个冲突" without presenting structured choices
+- Asking "要我帮你处理吗？" instead of directly presenting the tool UI
+
+**RIGHT**: For every `===CONFLICT_BEGIN===` block and `NEW_REPO:` marker, call AskUserQuestion immediately.
+
+#### CONFLICT example call
+
+When output contains a structured conflict block:
+
+```
+===CONFLICT_BEGIN===
+LABEL: settings.json
+REPO: /c/dotfiles/claude-code-config/settings.json
+LOCAL: /c/Users/user/.claude/settings.json
+REPO_TIME: 2025-04-07 14:32
+LOCAL_TIME: 2025-04-08 09:15
+DIFF:
+        --- /c/dotfiles/claude-code-config/settings.json
+        +++ /c/Users/user/.claude/settings.json
+        @@ -3,2 +3,2 @@
+        -  "theme": "dark"
+        +  "theme": "light"
+===CONFLICT_END===
+```
+
+Parse each field from the block, then call AskUserQuestion:
+
+```
+AskUserQuestion:
+  questions:
+    - header: "settings"
+      question: "Config file settings.json has a conflict. Which version to keep?"
+      multiSelect: false
+      options:
+        - label: "Repo version"
+          description: "Use dotfiles repo copy (REPO_TIME from block)"
+          preview: (DIFF lines from block, strip 8-space indent)
+        - label: "Local version"
+          description: "Use local machine copy (LOCAL_TIME from block)"
+          preview: (same DIFF content)
+        - label: "Skip"
+          description: "Keep both as-is, resolve manually later"
+```
+
+Field mapping:
+- `LABEL` → `question` text and `header` (trim whitespace, strip extension, truncate to 12 chars if needed)
+- `REPO_TIME` / `LOCAL_TIME` → option `description` timestamps
+- `DIFF` lines (strip 8-space indent) → option `preview` content
+- `REPO` / `LOCAL` → used in post-resolution `cp` commands (see Workflow § CONFLICT)
+
+#### NEW_REPO example call
+
+When output contains: `NEW_REPO: my-project | https://github.com/user/my-project.git`
+
+Read `WORKSPACE_ROOTS` from `.env` (semicolon-separated paths) to build options:
+
+```
+AskUserQuestion:
+  questions:
+    - header: "my-project"
+      question: "New repo my-project not found locally. Clone to which directory?"
+      multiSelect: false
+      options:
+        - label: "C:/Claude_code_cli"
+          description: "Clone to workspace root C:/Claude_code_cli/my-project"
+        - label: "Skip"
+          description: "Do nothing now, will ask again on next sync"
+        - label: "Ignore permanently"
+          description: "Add to .sync_ignore, never ask again"
+```
+
+Adapt options count to actual WORKSPACE_ROOTS entries (max 4 options total including Skip/Ignore).
+
+### Commit message rule
+
+Script-automated commits use mechanical messages. Claude-intervened commits (conflict resolution, handoff) use descriptive commit messages.
+
 ## Workflow
 
 ### Step 0: Check .env Exists (First Run Only)
@@ -40,37 +126,21 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 **If script succeeded (exit code 0):**
 - Display everything after the `[4/6]` summary marker verbatim — do not reformat, wrap in code blocks, or build a new table
 - If output contains **missing plugins detected**, show list and install commands, prompt user to run in Claude Code
-- If output contains **CONFLICT:** markers, enter conflict resolution flow (below)
+- If output contains **===CONFLICT_BEGIN===** blocks, enter conflict resolution flow (below)
 - If output contains **NEW_REPO:** markers, enter new repo handling flow (below)
 - If output contains **HANDOFF: Pending tasks detected**, proceed to Step 3
 - Otherwise, task complete
 
-**CONFLICT: markers (config file conflicts):**
-- Collect all CONFLICT lines with diff summaries and timestamps
-- Use **AskUserQuestion** to present each conflict:
-  - header: filename (max 12 chars)
-  - question: `Config file <name> has a conflict. Which version to keep?`
-  - options: `Repo version` (with timestamp), `Local version` (with timestamp), `Skip`
-  - preview: diff output (markdown)
-  - multiSelect: false
-- Max 4 questions per AskUserQuestion call; batch if more
-- Execute user’s choice:
-  - Repo: `cp "" ".bak"` then `cp "" ""`
-  - Local: `cp "" ".bak"` then `cp "" ""`
-  - Skip: no action
-- If any Local version chosen, commit + push in dotfiles repo (descriptive message)
+**===CONFLICT_BEGIN=== blocks** → Follow Critical Rules § CONFLICT example. Call AskUserQuestion (max 4 questions per call; batch if more). Then execute:
+- Repo chosen: `cp "$LOCAL" "${LOCAL}.bak"` then `cp "$REPO" "$LOCAL"`
+- Local chosen: `cp "$REPO" "${REPO}.bak"` then `cp "$LOCAL" "$REPO"`, then commit + push in dotfiles repo
+- Skip: no action
 - Continue to HANDOFF and other steps after all resolved
 
-**NEW_REPO: markers (new repos detected):**
-- Collect all `NEW_REPO: <name> | <url>` lines
-- Use **AskUserQuestion** per repo:
-  - header: repo name
-  - question: `New repo <name> not found locally. Clone to which directory?`
-  - options: one per WORKSPACE_ROOTS path + `Skip` + `Ignore permanently`
-- Execute:
-  - Path: `git clone <url> <path>/<name>`
-  - Skip: no action (asks again next time)
-  - Ignore: `echo <name> >> .sync_ignore`
+**NEW_REPO: markers** → Follow Critical Rules § NEW_REPO example. Call AskUserQuestion. Then execute:
+- Path chosen: `git clone <url> <path>/<name>`
+- Skip: no action (asks again next sync)
+- Ignore permanently: `echo <name> >> .sync_ignore`
 
 **If script partially failed (exit code 1):**
 - Display `[4/6]` summary verbatim first, then explain failures
@@ -80,7 +150,7 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
   - **push failed**: `pull --rebase` then push. If rebase conflicts, follow merge flow
   - **clone failed**: Check network/permissions, report to user
 
-**Rule: Script-automated steps use mechanical messages. Claude-intervened steps use descriptive commit messages.**
+**Commit messages**: See Critical Rules § Commit message rule.
 
 ### Step 3: Handle Handoff Tasks (Only When Detected)
 

@@ -197,6 +197,7 @@ fi
 
 CC_HOME="${HOME}/.claude"
 
+# CONFIG_MAP: declarative config file mappings — "repo_subpath|local_path|label"
 # 配置文件映射：dotfiles 子路径 | 本地目标 | 显示名
 CONFIG_MAP=(
     "claude-code-config/CLAUDE.md|${CC_HOME}/CLAUDE.md|CLAUDE.md"
@@ -566,8 +567,18 @@ _sync_one_way() {
     echo -e "  ${arrow} ${label}"
 }
 
-# --- 智能同步函数：比较内容 + 时间戳定方向 ---
-# 用法: sync_config_file <仓库文件> <本地文件> <显示名>
+# --- Smart sync function: compare content + resolve direction ---
+# Usage: sync_config_file <repo_file> <local_file> <label>
+#
+# Branch logic:
+#   1. Neither exists        → skip
+#   2. Only local exists     → copy local → repo
+#   3. Only repo exists      → copy repo → local
+#   4. Both exist, same      → skip (no diff)
+#   5. Both exist, different → CONFLICT
+#      - Interactive:     show diff + timestamps, prompt r/l/s
+#      - Non-interactive: emit ===CONFLICT_BEGIN/END=== block, default skip
+#                         (format consumed by .claude/skills/sync/SKILL.md)
 sync_config_file() {
     local REPO_FILE="$1"
     local LOCAL_FILE="$2"
@@ -593,22 +604,35 @@ sync_config_file() {
         return
     fi
 
-    # Content differs — show summary and ask user
-    echo -e "  ${YELLOW}!${NC} $LABEL: repo 和本地内容不同"
-    diff --unified=1 "$REPO_FILE" "$LOCAL_FILE" 2>/dev/null | head -20 || true
-    echo ""
-
-    local REPO_TIME LOCAL_TIME
+    # Content differs — compute shared metadata, then branch by mode
+    local REPO_TIME LOCAL_TIME DIFF_OUTPUT
     REPO_TIME=$(date -r "$REPO_FILE" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
     LOCAL_TIME=$(date -r "$LOCAL_FILE" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
-    echo "    Repo:  $REPO_TIME"
-    echo "    Local: $LOCAL_TIME"
-    echo ""
+    DIFF_OUTPUT=$(diff --unified=1 "$REPO_FILE" "$LOCAL_FILE" 2>/dev/null | head -20 || true)
+
     if [ "$INTERACTIVE" = true ]; then
+        # Interactive mode: human-readable output + prompt
+        echo -e "  ${YELLOW}!${NC} $LABEL: repo 和本地内容不同"
+        echo "$DIFF_OUTPUT"
+        echo ""
+        echo "    Repo:  $REPO_TIME"
+        echo "    Local: $LOCAL_TIME"
+        echo ""
         read -p "    选择: (r)epo 优先 / (l)ocal 优先 / (s)kip [s]: " CHOICE
     else
-        echo "    CONFLICT: $LABEL | repo=$REPO_FILE | local=$LOCAL_FILE"
-        CHOICE="s"
+        # Non-interactive mode (Claude Code): structured conflict block
+        # Format consumed by SKILL.md → AskUserQuestion flow
+        # Do not change field names or delimiters without updating SKILL.md
+        echo "===CONFLICT_BEGIN==="
+        echo "LABEL: $LABEL"
+        echo "REPO: $REPO_FILE"
+        echo "LOCAL: $LOCAL_FILE"
+        echo "REPO_TIME: $REPO_TIME"
+        echo "LOCAL_TIME: $LOCAL_TIME"
+        echo "DIFF:"
+        echo "$DIFF_OUTPUT" | sed 's/^/        /'
+        echo "===CONFLICT_END==="
+        CHOICE="s"  # Default skip; AI resolves via AskUserQuestion
     fi
     case "$CHOICE" in
         r|R)
