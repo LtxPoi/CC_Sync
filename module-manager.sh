@@ -28,6 +28,24 @@ TODAY=$(date +%Y-%m-%d)
 detect_gh || exit 1
 MODULE_HELPER=$(normalize_path "$SCRIPT_DIR/lib/module_helper.py")
 
+# --- 临时目录清理 trap ---
+_CLEANUP_DIRS=()
+_cleanup_temps() {
+    local d
+    for d in "${_CLEANUP_DIRS[@]+"${_CLEANUP_DIRS[@]}"}"; do
+        [ -d "$d" ] && rm -rf "$d"
+    done
+}
+trap _cleanup_temps EXIT INT TERM
+
+# --- 仓库格式验证 ---
+_validate_repo_format() {
+    if [[ ! "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        echo -e "${RED}错误：无效的仓库格式 '$1'（应为 owner/repo）${NC}" >&2
+        return 1
+    fi
+}
+
 py_helper() {
     PYTHONIOENCODING=utf-8 python "$MODULE_HELPER" "$@"
 }
@@ -48,12 +66,6 @@ save_manifest() {
 
 # ─── Shared Python micro-helpers ─────────────────────────────────
 # Small Python operations reused across multiple commands.
-
-# Parse a JSON object string into bash variable assignments, then eval.
-# Usage: eval "$(json_to_vars "$json_line")"
-json_to_vars() {
-    py_helper json-to-vars "$1"
-}
 
 # Check whether a module name exists in the manifest JSON.
 # Prints "yes" or "no".
@@ -92,6 +104,7 @@ download_github_repo() {
     dest=$(normalize_path "$3")
     local tmp_clone
     tmp_clone=$(safe_mktemp)
+    _CLEANUP_DIRS+=("$tmp_clone")
 
     if ! git clone --depth 1 --branch "$ref" --single-branch \
          "https://github.com/${repo}.git" "$tmp_clone" 2>/dev/null; then
@@ -162,6 +175,7 @@ cmd_update() {
     local needs_update
     local check_tmpdir
     check_tmpdir=$(safe_mktemp)
+    _CLEANUP_DIRS+=("$check_tmpdir")
     local check_stderr="${check_tmpdir}/stderr.txt"
     needs_update=$(GH_CMD="$GH" py_helper update-check "$data" "$target" 2>"$check_stderr") || {
         local rc=$?
@@ -183,8 +197,9 @@ cmd_update() {
     local errors=0
 
     while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
         local name kind repo path ref install_path latest_sha
-        eval "$(json_to_vars "$line")"
+        IFS=$'\t' read -r name kind repo path ref install_path latest_sha <<< "$(echo "$line" | py_helper tab-vars)"
 
         echo -e "→ Updating ${name}..."
         local dest="${SKILLS_DIR}/${install_path}"
@@ -192,6 +207,7 @@ cmd_update() {
         local ok=true
         local tmp_dest
         tmp_dest=$(safe_mktemp)
+        _CLEANUP_DIRS+=("$tmp_dest")
 
         if ! _download_to_tmp "$kind" "$repo" "$path" "$ref" "$tmp_dest"; then ok=false; fi
 
@@ -248,6 +264,11 @@ cmd_install() {
     # Parse source
     IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
 
+    # Validate repo format
+    if [[ ("$kind" == "github-subdir" || "$kind" == "github-repo") && -n "$repo" ]]; then
+        _validate_repo_format "$repo" || exit 1
+    fi
+
     # Determine install name
     local install_name
     if [[ -n "$name_override" ]]; then
@@ -283,6 +304,7 @@ cmd_install() {
     echo -e "→ Installing ${install_name}..."
     local tmp_dest
     tmp_dest=$(safe_mktemp)
+    _CLEANUP_DIRS+=("$tmp_dest")
     local dl_ok=true
     if [[ "$kind" == "github-subdir" ]]; then
         download_github_subdir "$repo" "$path" "${ref:-main}" "$tmp_dest" || dl_ok=false
@@ -371,6 +393,11 @@ cmd_adopt() {
     # Parse source
     IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
 
+    # Validate repo format
+    if [[ ("$kind" == "github-subdir" || "$kind" == "github-repo") && -n "$repo" ]]; then
+        _validate_repo_format "$repo" || exit 1
+    fi
+
     # Get current commit SHA
     local sha=""
     if [[ -n "$repo" ]]; then
@@ -389,6 +416,7 @@ cmd_adopt() {
 
 cmd_adopt_bulk() {
     local repo="$1"
+    _validate_repo_format "$repo" || exit 1
 
     echo -e "→ Scanning ${repo} for matching skills..."
 
@@ -470,14 +498,15 @@ cmd_restore() {
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local name kind repo path ref install_path
-        eval "$(json_to_vars "$line")"
+        local name kind repo path ref install_path latest_sha
+        IFS=$'\t' read -r name kind repo path ref install_path latest_sha <<< "$(echo "$line" | py_helper tab-vars)"
 
         local dest="${SKILLS_DIR}/${install_path}"
         echo -e "→ Restoring ${name}..."
 
         local tmp_dest ok=true
         tmp_dest=$(safe_mktemp)
+        _CLEANUP_DIRS+=("$tmp_dest")
         if ! _download_to_tmp "$kind" "$repo" "$path" "$ref" "$tmp_dest"; then ok=false; fi
 
         if $ok; then

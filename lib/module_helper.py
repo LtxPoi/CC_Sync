@@ -24,6 +24,47 @@ DEFAULT_REF = "main"
 MODULE_TYPE = "skill"
 
 
+def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
+    """Download file via gh api (authenticated) with timeout and size limit.
+    Falls back to urllib if gh is unavailable."""
+    # Try gh api first (authenticated, handles private repos)
+    gh_cmd = os.environ.get("GH_CMD", "gh")
+    # Extract owner/repo/ref/path from raw.githubusercontent.com URL
+    # Format: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}
+    import re as _re
+    m = _re.match(r"https://raw\.githubusercontent\.com/([^/]+/[^/]+)/([^/]+)/(.*)", url)
+    if m:
+        repo, ref, path = m.group(1), m.group(2), m.group(3)
+        api_url = f"repos/{repo}/contents/{path}?ref={ref}"
+        try:
+            result = subprocess.run(
+                [gh_cmd, "api", api_url, "--header", "Accept: application/vnd.github.raw+json"],
+                capture_output=True, timeout=timeout,
+            )
+            if result.returncode == 0 and len(result.stdout) > 0:
+                if len(result.stdout) > max_bytes:
+                    raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
+                with open(out, "wb") as f:
+                    f.write(result.stdout)
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # gh not available or timed out, fall back to urllib
+
+    # Fallback: direct urllib download (unauthenticated)
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total = 0
+        with open(out, "wb") as f:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
+                f.write(chunk)
+
+
 # ── TOML helpers ────────────────────────────────────────────────────
 
 def _toml_escape(s):
@@ -132,17 +173,28 @@ def cmd_manifest_write():
                     lines.append(f'{key} = "{_toml_escape(val)}"')
             lines.append("")
 
-    os.makedirs(os.path.dirname(manifest), exist_ok=True)
+    dirname = os.path.dirname(manifest)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(manifest, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 
 def cmd_json_to_vars():
-    """Parse JSON object -> bash variable assignments."""
+    """Parse JSON object -> bash variable assignments. (Legacy, kept for compat.)"""
     d = json.loads(sys.argv[2])
     for k, v in d.items():
         v = str(v).replace("'", "'\"'\"'")
         print(f"{k}='{v}'")
+
+
+def cmd_tab_vars():
+    """Output module fields as tab-separated values in fixed order.
+    Reads JSON from stdin (piped from bash via: echo "$json" | py_helper tab-vars).
+    Fields: name, kind, repo, path, ref, install_path, latest_sha"""
+    obj = json.loads(sys.stdin.readline())
+    fields = ["name", "kind", "repo", "path", "ref", "install_path", "latest_sha"]
+    print("\t".join(str(obj.get(f, "")) for f in fields))
 
 
 def cmd_module_exists():
@@ -210,7 +262,7 @@ def cmd_download_github_subdir():
                     continue
                 out = os.path.join(dest, name)
                 try:
-                    urllib.request.urlretrieve(url, out)
+                    _safe_download(url, out)
                 except Exception as e:
                     print(f"  Failed: {name} ({e})", file=sys.stderr)
                     ok = False
@@ -416,6 +468,7 @@ COMMANDS = {
     "manifest-read": cmd_manifest_read,
     "manifest-write": cmd_manifest_write,
     "json-to-vars": cmd_json_to_vars,
+    "tab-vars": cmd_tab_vars,
     "module-exists": cmd_module_exists,
     "manifest-add-module": cmd_manifest_add_module,
     "download-github-subdir": cmd_download_github_subdir,

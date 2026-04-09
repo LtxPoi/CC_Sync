@@ -7,8 +7,8 @@
 _COMMON_SH_LOADED=1
 
 # --- 前置检查 ---
-if [ -z "$SCRIPT_DIR" ]; then
-    echo "错误：source lib/common.sh 前必须设置 SCRIPT_DIR" >&2
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
+    echo "错误：SCRIPT_DIR 未设置或不是有效目录（当前值：'${SCRIPT_DIR:-}'）" >&2
     return 1
 fi
 
@@ -19,7 +19,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 GRAY='\033[90m'
 
-# --- 工作区根目录（当前项目的父目录）---
+# --- 工作区根目录（CC_General 的父目录）---
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- GitHub topic 常量 ---
@@ -77,7 +77,7 @@ get_machine_name() {
 }
 
 # --- 计算 CC 项目哈希（绝对路径 → ~/.claude/projects/ 下的目录名）---
-# CC 将路径中的 : \ _ / 全部替换为 -，如 D:\Claude_Code\CC_Sync → D--Claude-Code-CC-Sync
+# CC 将路径中的 : \ _ / 全部替换为 -，如 D:\Claude_Code\CC_General → D--Claude-Code-CC-General
 compute_cc_hash() {
     local p
     p=$(normalize_path "${1%/}")
@@ -90,6 +90,10 @@ compute_cc_hash() {
 detect_github_user() {
     if [ -n "${GITHUB_USER:-}" ]; then
         return 0
+    fi
+    if [ -z "${GH:-}" ]; then
+        echo -e "${RED}内部错误：detect_github_user 前必须先调用 detect_gh${NC}" >&2
+        return 1
     fi
     GITHUB_USER=$("$GH" api user -q .login 2>/dev/null)
     if [ -z "$GITHUB_USER" ]; then
@@ -105,7 +109,7 @@ safe_mktemp() {
 
 # --- 跨平台 stat（兼容 GNU coreutils 和 BSD/macOS）---
 _stat_field() {
-    stat -c"$1" "$3" 2>/dev/null || stat -f"$2" "$3" 2>/dev/null
+    stat -c"$1" "$3" 2>/dev/null || stat -f"$2" "$3" 2>/dev/null || return 1
 }
 
 # file_mtime <path> — 输出文件修改时间（Unix epoch 秒）
