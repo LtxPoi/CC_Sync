@@ -176,7 +176,7 @@ def cmd_manifest_write():
     dirname = os.path.dirname(manifest)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
-    with open(manifest, "w", encoding="utf-8") as f:
+    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
 
 
