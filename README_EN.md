@@ -2,7 +2,7 @@
 
 # CC_Sync
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![GitHub release](https://img.shields.io/github/v/release/LtxPoi/CC_Sync)](https://github.com/LtxPoi/CC_Sync/releases) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![GitHub release](https://img.shields.io/github/v/release/koagaroon/CC_Sync)](https://github.com/koagaroon/CC_Sync/releases) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
 Multi-repo sync, cross-device task handoff, and module management for Claude Code.
 
@@ -64,7 +64,7 @@ You need a working Claude Code CLI. See [Claude Code docs](https://docs.anthropi
 Open a terminal (Windows: **PowerShell** or **Git Bash**; macOS/Linux: **Terminal**):
 
 ```bash
-git clone https://github.com/LtxPoi/CC_Sync.git
+git clone https://github.com/koagaroon/CC_Sync.git
 ```
 
 ### Step 2: Tag Your GitHub Repos
@@ -253,7 +253,7 @@ CRLF phantom diff on Windows (LF vs CRLF). Not real content changes.
 
 ### Setting up a new device
 
-1. In **PowerShell** or **Git Bash**: `git clone https://github.com/LtxPoi/CC_Sync.git`
+1. In **PowerShell** or **Git Bash**: `git clone https://github.com/koagaroon/CC_Sync.git`
 2. Continue in **Git Bash**: `cd CC_Sync && bash sync.sh` (complete wizard)
 3. Open **Claude Code**, navigate to CC_Sync, say "register new device xxx"
 4. Continue in **Claude Code**: say "sync" to pull all configs and code

@@ -2,7 +2,7 @@
 
 # CC_Sync
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![GitHub release](https://img.shields.io/github/v/release/LtxPoi/CC_Sync)](https://github.com/LtxPoi/CC_Sync/releases) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![GitHub release](https://img.shields.io/github/v/release/koagaroon/CC_Sync)](https://github.com/koagaroon/CC_Sync/releases) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
 Claude Code 多仓库同步、跨设备任务传递、模块管理工具。
 
@@ -64,7 +64,7 @@ gh auth login
 打开终端（Windows 用 **PowerShell** 或 **Git Bash**，macOS/Linux 用 **Terminal**），运行：
 
 ```bash
-git clone https://github.com/LtxPoi/CC_Sync.git
+git clone https://github.com/koagaroon/CC_Sync.git
 ```
 
 ### 第 2 步：给你的 GitHub 仓库添加标签
@@ -262,7 +262,7 @@ Windows 上的 CRLF 幻影改动（行尾符差异），不是真正的内容变
 
 ### 新设备怎么恢复
 
-1. 在终端（**PowerShell** 或 **Git Bash**）中克隆：`git clone https://github.com/LtxPoi/CC_Sync.git`
+1. 在终端（**PowerShell** 或 **Git Bash**）中克隆：`git clone https://github.com/koagaroon/CC_Sync.git`
 2. 继续在终端中进入目录并运行（路径替换为你的实际位置）：`cd /c/Projects/CC_Sync && bash sync.sh`（完成向导）
 3. 打开 **Claude Code**，进入 CC_Sync 目录，说“注册新设备 xxx”
 4. 继续在 **Claude Code** 中说“同步”拉取所有配置和代码
