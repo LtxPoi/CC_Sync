@@ -12,7 +12,7 @@ user_invocable: true
 
 ### AskUserQuestion is MANDATORY for interactive decisions
 
-When sync.sh output contains `===CONFLICT_BEGIN===` blocks or `NEW_REPO:` markers, you MUST call the AskUserQuestion tool with structured options. This is non-negotiable.
+When sync.sh output contains `===CONFLICT_BEGIN===` blocks or `NEW_REPO:` markers, call the AskUserQuestion tool with structured options.
 
 **WRONG** (never do this):
 - Printing conflict details as text and asking "你想保留哪个版本？" in conversation

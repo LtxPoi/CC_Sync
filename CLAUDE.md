@@ -32,8 +32,8 @@ Multi-repo sync, cross-device handoff, and module management for Claude Code.
 ## First Run
 
 When `.env` does not exist:
-- **Interactive terminal**: First-run wizard launches automatically. It prompts for: dotfiles repo path, whether to enable repo sync, and workspace root directories.
-- **Non-interactive** (Claude Code Bash tool): Exits with error. User must run `bash sync.sh` in an interactive terminal first.
+- **Interactive terminal**: The first-run wizard launches automatically. It prompts for the dotfiles repo path, whether to enable repo sync, and workspace root directories.
+- **Non-interactive** (Claude Code Bash tool): The wizard needs a TTY for its prompts, so sync.sh exits with an error. Run `bash sync.sh` once in an interactive terminal (e.g. Git Bash, PowerShell) to create `.env`; afterward `/sync` works normally from Claude Code.
 
 Example `.env` (created by wizard):
 ```
@@ -59,19 +59,19 @@ bash module-manager.sh list          # List tracked modules
 
 ### Functions and Scope
 
-- **All helper functions must be defined at module level** (top of script, outside conditionals). A function inside an `if` block will not exist when that branch is not taken. Step 3 callers will get `command not found`.
-- **`local` keyword is only valid inside functions.** In the main execution body (while loops, etc.), use plain variable assignment.
+- A function defined inside an `if` block does not exist when that branch is skipped, and Step 3 callers then fail with `command not found` — define all helper functions at module level (top of script, outside conditionals).
+- The `local` keyword is only valid inside functions. In the main execution body (while loops, etc.), use plain variable assignment.
 
 ### .env File Safety
 
-- **All values must be double-quoted** when writing: `KEY="value"`. Unquoted semicolons (`E:/Work;F:/Personal`) will be split by `source` into separate commands.
-- **Use in-loop elif replacement + found-flag append** when modifying keys. Never unconditionally append after the loop (creates duplicate keys).
-- **Strip quotes from old values** when reading (`.strip('"')`) to handle both legacy and new formats.
+- Unquoted values containing semicolons (e.g. `E:/Work;F:/Personal`) are split by `source` into separate commands — write values double-quoted: `KEY="value"`.
+- Unconditionally appending a key after a replacement loop creates duplicate entries — use in-loop elif replacement with a found-flag append instead.
+- Older `.env` files may store values without quotes; strip quotes from old values when reading (`.strip('"')`) so both legacy and new formats parse correctly.
 
 ### Python File I/O
 
-- **Always use `newline="\n"`** in `open(..., "w")`. Windows defaults to CRLF, causing git phantom diffs.
-- **Always use `encoding="utf-8"`**. Windows defaults to GBK/cp936.
+- Windows defaults to CRLF line endings, which produce git phantom diffs on synced files — pass `newline="\n"` to `open(..., "w")`.
+- Windows defaults to GBK/cp936 for text I/O, which fails on files created elsewhere — pass `encoding="utf-8"` explicitly.
 
 ### Clone Return Codes
 
@@ -85,13 +85,13 @@ New return codes must be added to both the function and the caller dispatch.
 
 ### Path Handling (Windows / Git Bash)
 
-- **`dirname "C:/foo"` returns `"C:"`** not `"C:/"`. Fix after dirname: `[[ "$parent_dir" =~ ^[A-Za-z]:$ ]] && parent_dir="${parent_dir}/"`
-- **Pass paths from bash to Python via `normalize_path`** (lib/common.sh). Python cannot resolve `/c/Users/...` paths.
-- **MSYS2 auto-converts `/f`, `/v`** to paths. Wrap Windows-native commands in `cmd.exe //c "..."`.
+- `dirname "C:/foo"` returns `"C:"` rather than `"C:/"`, which breaks later path concatenation — fix after dirname: `[[ "$parent_dir" =~ ^[A-Za-z]:$ ]] && parent_dir="${parent_dir}/"`.
+- Native Windows Python cannot resolve Git Bash-style `/c/Users/...` paths — pass paths from bash to Python via `normalize_path` (lib/common.sh).
+- MSYS2 auto-converts leading-slash arguments like `/f` and `/v` into path translations before the Windows-native command sees them — wrap such commands in `cmd.exe //c "..."`.
 
 ### Multi-Root Repo Lookup
 
-- `_find_repo_dir` returns the first directory name match across `WS_ROOTS`. The Step 3 caller must verify `remote.origin.url` matches the expected GitHub URL before processing. Without this, a same-named directory in another root could be auto-pushed to the wrong remote.
+- `_find_repo_dir` returns the first directory name match across `WS_ROOTS`, so a same-named directory in another root could be auto-pushed to the wrong remote — the Step 3 caller must verify `remote.origin.url` matches the expected GitHub URL before processing.
 
 ### Sync Step Dependencies
 
@@ -105,10 +105,10 @@ bash -n sync.sh              # Syntax check
 bash sync.sh                 # Full run
 ```
 
-## Do NOT
+## Pitfalls to Avoid
 
-- Do not `source` .env with unquoted values containing semicolons or spaces
-- Do not use `((var++))` in bash scripts with `set -e` when var could be 0 (evaluates to falsy, exits script). Use `var=$((var + 1))`
-- Do not place function definitions inside conditional blocks
-- Do not write files without `newline="\n"` on Windows
-- Do not assume a repo directory's remote matches the expected URL in multi-root setups
+- `source`-ing a `.env` with unquoted values containing semicolons or spaces splits them into separate commands.
+- Under `set -e`, `((var++))` evaluates to falsy when `var` is 0 and exits the script — use `var=$((var + 1))`.
+- Function definitions inside conditional blocks disappear when the branch is skipped (see Functions and Scope above).
+- Writing files without `newline="\n"` on Windows produces CRLF and git phantom diffs.
+- In multi-root setups, a repo directory's remote is not guaranteed to match the expected URL — verify `remote.origin.url` before pushing.

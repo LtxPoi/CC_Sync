@@ -5,8 +5,7 @@ description: "Manages third-party Claude Code modules (skills, plugins, MCP serv
 
 # Module Manager — Third-Party Module Management
 
-Manages all externally-sourced modules (skills / plugins / MCP servers) under `~/.claude/skills/`.
-Does not manage user-authored skills in project `.claude/skills/` directories.
+This skill installs, updates, removes, restores, and tracks externally-sourced modules (skills / plugins / MCP servers) under `~/.claude/skills/`, using `modules.toml` as the manifest.
 
 ## Not For
 
@@ -19,9 +18,9 @@ Does not manage user-authored skills in project `.claude/skills/` directories.
 
 ### Always confirm source format before install
 
-When user says something vague like "install the pdf skill", do NOT guess the full `owner/repo:path` source.
+A vague request like "install the pdf skill" does not identify a unique `owner/repo:path` source — guessing risks installing the wrong module.
 
-**WRONG** (never do this):
+**WRONG**:
 - Running `bash module-manager.sh install anthropics/skills:skills/pdf` based on a guess
 - Assuming `owner/repo` when user only said a skill name
 - Silently choosing between repo-subdirectory vs. entire-repo format
@@ -29,6 +28,8 @@ When user says something vague like "install the pdf skill", do NOT guess the fu
 **RIGHT**: Confirm the exact source with the user before calling the script.
 
 ### Show all script output verbatim
+
+Script output is the source of truth for which modules changed and why; reformatting it can drop details the user needs.
 
 **WRONG**:
 - Reformatting the `list` table into markdown
