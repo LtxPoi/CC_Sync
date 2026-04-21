@@ -613,16 +613,19 @@ sync_config_file() {
     if [ "$INTERACTIVE" = true ]; then
         # Interactive mode: human-readable output + prompt
         echo -e "  ${YELLOW}!${NC} $LABEL: repo 和本地内容不同"
+        echo "    （diff 中 '-' 开头的行为 repo 版本，'+' 开头的行为 local 版本）"
         echo "$DIFF_OUTPUT"
         echo ""
         echo "    Repo:  $REPO_TIME"
         echo "    Local: $LOCAL_TIME"
         echo ""
-        read -p "    选择: (r)epo 优先 / (l)ocal 优先 / (s)kip [s]: " CHOICE
+        read -p "    选择: (r)epo 优先 / (l)ocal 优先 / (s)kip 下次再问 [s]: " CHOICE
     else
         # Non-interactive mode (Claude Code): structured conflict block
         # Format consumed by SKILL.md → AskUserQuestion flow
         # Do not change field names or delimiters without updating SKILL.md
+        # DIFF payload includes a direction hint as its first content line so the
+        # AskUserQuestion preview is self-explanatory about which side is which
         echo "===CONFLICT_BEGIN==="
         echo "LABEL: $LABEL"
         echo "REPO: $REPO_FILE"
@@ -630,6 +633,7 @@ sync_config_file() {
         echo "REPO_TIME: $REPO_TIME"
         echo "LOCAL_TIME: $LOCAL_TIME"
         echo "DIFF:"
+        echo "        (lines starting with '-' show the REPO version; lines with '+' show the LOCAL version)"
         echo "$DIFF_OUTPUT" | sed 's/^/        /'
         echo "===CONFLICT_END==="
         CHOICE="s"  # Default skip; AI resolves via AskUserQuestion

@@ -34,8 +34,9 @@ LOCAL: /c/Users/user/.claude/settings.json
 REPO_TIME: 2025-04-07 14:32
 LOCAL_TIME: 2025-04-08 09:15
 DIFF:
-        --- /c/dotfiles/claude/settings.json
-        +++ /c/Users/user/.claude/settings.json
+        (lines starting with '-' show the REPO version; lines with '+' show the LOCAL version)
+        --- <dotfiles-path>/claude/settings.json
+        +++ ~/.claude/settings.json
         @@ -3,2 +3,2 @@
         -  "theme": "dark"
         +  "theme": "light"
@@ -45,7 +46,7 @@ DIFF:
 Parse each field from the block, then call AskUserQuestion:
 
 ```json
-{"questions": [{"header": "settings", "question": "Config file settings.json has a conflict. Which version to keep?", "multiSelect": false, "options": [{"label": "Repo version", "description": "Use dotfiles repo copy (REPO_TIME from block)", "preview": "(DIFF lines from block, strip 8-space indent)"}, {"label": "Local version", "description": "Use local machine copy (LOCAL_TIME from block)", "preview": "(same DIFF content)"}, {"label": "Skip", "description": "Keep both as-is, resolve manually later"}]}]}
+{"questions": [{"header": "settings", "question": "Config file settings.json has a conflict. Which version to keep?", "multiSelect": false, "options": [{"label": "Repo version", "description": "Use dotfiles repo copy (REPO_TIME from block)", "preview": "(DIFF lines from block, strip 8-space indent)"}, {"label": "Local version", "description": "Use local machine copy (LOCAL_TIME from block)", "preview": "(same DIFF content)"}, {"label": "Ask again next sync", "description": "Leave both versions as-is for now; this conflict will reappear on the next /sync so the decision can wait"}]}]}
 ```
 
 Field mapping:
@@ -110,7 +111,7 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 **===CONFLICT_BEGIN=== blocks** → Follow Critical Rules § CONFLICT example. Call AskUserQuestion (max 4 questions per call; batch if more). Then execute:
 - Repo chosen: `cp "$LOCAL" "${LOCAL}.bak"` then `cp "$REPO" "$LOCAL"`
 - Local chosen: `cp "$REPO" "${REPO}.bak"` then `cp "$LOCAL" "$REPO"`, then commit + push in dotfiles repo
-- Skip: no action
+- Ask again next sync: no action (the same conflict will reappear on the next /sync)
 - Continue to HANDOFF and other steps after all resolved
 
 **NEW_REPO: markers** → Follow Critical Rules § NEW_REPO example. Call AskUserQuestion. Then execute:
