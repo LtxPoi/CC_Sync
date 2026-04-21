@@ -67,6 +67,44 @@ Read `WORKSPACE_ROOTS` from `.env` (semicolon-separated paths) to build options:
 
 Adapt options count to actual WORKSPACE_ROOTS entries (max 4 options total including Skip/Ignore).
 
+#### UNTRACKED example call
+
+When a project repo has uncommitted changes, sync.sh does NOT call `git add -A` anymore — it emits an UNTRACKED block listing every untracked file so each one can be decided individually. Example:
+
+```
+===UNTRACKED_BEGIN===
+REPO: my-project
+REPO_PATH: /c/workspace/my-project
+FILES:
+        .tmp_review/round1.md
+        docs/new_feature.md
+===UNTRACKED_END===
+```
+
+Parse each FILE line (strip 8-space indent). Call AskUserQuestion with one question per file (max 4 per call; batch across repos if more files):
+
+```json
+{"questions": [{"header": "round1.md", "question": "my-project has untracked file .tmp_review/round1.md — include in commit?", "multiSelect": false, "options": [{"label": "Include", "description": "Add this file to the sync auto-commit"}, {"label": "Ask again next sync", "description": "Skip this run; file stays untracked, will reappear on next /sync"}, {"label": "Never ask again", "description": "Append exact path to .gitignore in a separate descriptive commit"}]}]}
+```
+
+Use the file's basename as `header` (truncate to 12 chars if needed); full relative path in `question` text.
+
+Field mapping:
+- `REPO` → identifies the repo (matches its entry in the main summary)
+- `REPO_PATH` → absolute path used as `cd` target for post-resolution commands
+- Each `FILE` line (strip 8-space indent) → one AskUserQuestion question
+
+After ALL UNTRACKED questions resolved (across all repos), execute in each repo's REPO_PATH:
+1. Apply per-file choice:
+   - **Include**: `git add "<file>"`
+   - **Ask again next sync**: no action (file stays untracked)
+   - **Never ask again**: `echo "<file>" >> .gitignore` (exact path, not pattern)
+2. Stage tracked modifications (excluding .gitignore): `git add -u -- ':!.gitignore'`
+3. If anything is staged (`git diff --cached --quiet` returns non-zero): commit with mechanical message `sync: auto commit from <hostname>` and push.
+4. If `.gitignore` has unstaged modifications from "Never ask again" choices: `git add .gitignore && git commit -m "chore(.gitignore): 忽略 sync 扫描到的未跟踪文件" && git push` as a separate second commit.
+
+If nothing is staged after step 2 (user chose "Ask again" for all files and the repo had no tracked modifications), no commit is made — this is correct, not an error.
+
 ### Commit message rule
 
 Script-automated commits use mechanical messages. Claude-intervened commits (conflict resolution, handoff) use descriptive Chinese messages.
@@ -119,6 +157,13 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 - Skip: no action (asks again next sync)
 - Ignore permanently: `echo <name> >> .sync_ignore`
 
+**===UNTRACKED_BEGIN=== blocks** → Follow Critical Rules § UNTRACKED example. Ask AskUserQuestion per file (max 4 per call; batch across repos if more). Then per-file in the repo's REPO_PATH:
+- Include: `git add "<file>"`
+- Ask again next sync: no action
+- Never ask again: `echo "<file>" >> .gitignore`
+
+Per repo after all per-file actions: `git add -u -- ':!.gitignore'`, then commit + push with mechanical message if anything staged. If `.gitignore` was modified, second commit with descriptive Chinese message + push.
+
 **If script partially failed (exit code 1):**
 - Display `[4/6]` summary verbatim first, then explain failures
 - Handle each failed repo:
@@ -163,6 +208,7 @@ Username via `gh api user -q .login`. Next /sync auto-discovers.
 - **Output format dependency**: Step 2 relies on `[4/6]` marker. Update this file if sync.sh format changes.
 - **Handoff trigger**: Step 3 triggered by `HANDOFF: Pending tasks detected`. Device checks done by sync.sh step [5/6].
 - **Plugin detection**: After syncing settings.json, script compares `enabledPlugins` vs `installed_plugins.json`. Claude cannot run `claude plugin` from bash — prompt user.
+- **UNTRACKED marker deferral**: When `===UNTRACKED_BEGIN===` blocks appear in the output, sync.sh has NOT committed or pushed that repo — it's waiting for SKILL.md to resolve via AskUserQuestion and execute the commit. The repo's summary line will read `未跟踪文件待决定`; this is pending user input, not an error. Complete the UNTRACKED flow before treating /sync as done.
 
 ## Experience Log
 

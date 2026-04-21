@@ -1140,9 +1140,55 @@ _process_repo() {
         return
     fi
 
-    # 有改动：add + commit + push
-    echo "检测到改动，正在提交..."
-    git add -A
+    # 有改动：检测未跟踪文件，避免盲目 git add -A 把 scratch 文件误提交
+    echo "检测到改动，正在处理..."
+
+    # 收集未跟踪且未被 .gitignore 忽略的文件
+    local UNTRACKED_FILES
+    UNTRACKED_FILES=$(git ls-files --others --exclude-standard 2>/dev/null || true)
+
+    if [ -n "$UNTRACKED_FILES" ]; then
+        if [ "$INTERACTIVE" = false ]; then
+            # 非交互模式：emit 标记供 SKILL.md 读取并调用 AskUserQuestion
+            # 本轮不提交，由 AI 层决策后在各仓库执行后续 git add/commit/push
+            # Format consumed by SKILL.md → UNTRACKED AskUserQuestion flow
+            # Do not change field names or delimiters without updating SKILL.md
+            echo "===UNTRACKED_BEGIN==="
+            echo "REPO: $REPO_NAME"
+            echo "REPO_PATH: $(pwd)"
+            echo "FILES:"
+            echo "$UNTRACKED_FILES" | sed 's|^|        |'
+            echo "===UNTRACKED_END==="
+            echo "${REPO_NAME}|未跟踪文件待决定" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+            echo ""
+            return
+        else
+            # 交互模式：逐文件询问
+            echo "  检测到未跟踪文件，请逐个决定："
+            while IFS= read -r untracked_file; do
+                [ -z "$untracked_file" ] && continue
+                read -p "    $untracked_file: (i)nclude / (s)kip 下次再问 / (n)ever 再问 [s]: " uc < /dev/tty
+                uc=$(echo "$uc" | tr -d '\r\n')
+                case "$uc" in
+                    i|I) git add "$untracked_file" ;;
+                    n|N) echo "$untracked_file" >> .gitignore ;;
+                    *) : ;;  # skip (default) — 下次 sync 会再问
+                esac
+            done <<< "$UNTRACKED_FILES"
+        fi
+    fi
+
+    # Tracked modifications 始终自动暂存（排除 .gitignore，以便作为独立的第二次提交）
+    git add -u -- ':!.gitignore'
+
+    # 若无 staged 内容（用户跳过了所有未跟踪文件 + 无 tracked 改动），无需提交
+    if git diff --cached --quiet; then
+        echo "${REPO_NAME}|无改动（用户跳过所有未跟踪文件）" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+        echo "已跳过（无内容可提交）"
+        echo ""
+        return
+    fi
+
     if ! git commit -m "sync: auto commit from $(hostname)"; then
         echo "${REPO_NAME}|commit 失败 - 需要 Claude 处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
         echo -e "${RED}${REPO_NAME} commit 失败${NC}"
@@ -1150,6 +1196,19 @@ _process_repo() {
         echo ""
         return
     fi
+
+    # 若 .gitignore 因 "never again" 被修改，作为独立的描述性第二次提交
+    if ! git diff --quiet .gitignore 2>/dev/null; then
+        git add .gitignore
+        if ! git commit -m "chore(.gitignore): 忽略 sync 扫描到的未跟踪文件"; then
+            echo "${REPO_NAME}|gitignore commit 失败 - 需要 Claude 处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+            echo -e "${RED}${REPO_NAME} gitignore commit 失败${NC}"
+            touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
+            echo ""
+            return
+        fi
+    fi
+
     if ! git push 2>&1; then
         echo "${REPO_NAME}|push 失败 - 需要 Claude 处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
         echo -e "${RED}${REPO_NAME} push 失败${NC}"
@@ -1197,8 +1256,15 @@ while IFS='|' read -r REPO_NAME REPO_URL; do
             touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
             continue
         fi
-        # 已存在且 URL 匹配：后台处理（保持并行）
-        _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR" > "${SYNC_TMPDIR}/${REPO_NAME}.out" 2>&1 &
+        # 已存在且 URL 匹配：
+        # - 非交互模式：后台并行处理
+        # - 交互模式：串行前台处理（防止多个未跟踪文件 prompt 争抢 /dev/tty），
+        #   用 tee 让输出同时到终端和 .out 文件，不影响后续汇总
+        if [ "$INTERACTIVE" = true ]; then
+            _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR" 2>&1 | tee "${SYNC_TMPDIR}/${REPO_NAME}.out"
+        else
+            _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR" > "${SYNC_TMPDIR}/${REPO_NAME}.out" 2>&1 &
+        fi
     elif [ "$INTERACTIVE" = true ]; then
         # 新仓库 + 交互模式：前台运行 clone 菜单（不重定向，保持终端交互）
         CLONE_RESULT_DIR=""
