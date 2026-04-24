@@ -750,8 +750,41 @@ _sync_one_way() {
     return 0
 }
 
+# --- 归一化等价比较：用于 memory 文件忽略 CC harness 自动写入的 originSessionId ---
+# Usage: _files_equivalent <file_a> <file_b> [norm_mode]
+#   norm_mode 为空 → 字节级比较（等价于 cmp -s）
+#   norm_mode = "memory" → 剥离 originSessionId 行 + frontmatter 闭合 --- 后的那一空行再比较，
+#       消除 CC 升级后 harness 自动写入 provenance 字段引发的 spurious 冲突。
+# 返回 0 表示等价（跳过同步），非 0 表示真差异（进入冲突流程）。
+_files_equivalent() {
+    local A="$1" B="$2" NORM="${3:-}"
+    if [ -z "$NORM" ]; then
+        cmp -s "$A" "$B"
+        return
+    fi
+    local A_PY B_PY
+    A_PY=$(normalize_path "$A")
+    B_PY=$(normalize_path "$B")
+    python -c "
+import sys, re
+def load(p):
+    with open(p, 'r', encoding='utf-8') as f:
+        return f.read()
+def norm_memory(t):
+    t = re.sub(r'^originSessionId:[^\n]*\n?', '', t, flags=re.MULTILINE)
+    t = re.sub(r'^(---\n.*?\n---\n)\n', r'\1', t, count=1, flags=re.DOTALL)
+    return t
+a, b = load(sys.argv[1]), load(sys.argv[2])
+if sys.argv[3] == 'memory':
+    a, b = norm_memory(a), norm_memory(b)
+sys.exit(0 if a == b else 1)
+" "$A_PY" "$B_PY" "$NORM"
+}
+
 # --- Smart sync function: compare content + resolve direction ---
-# Usage: sync_config_file <repo_file> <local_file> <label>
+# Usage: sync_config_file <repo_file> <local_file> <label> [norm_mode]
+#   norm_mode (optional) forwarded to _files_equivalent — currently only "memory"
+#   is recognized; other callers omit it for byte-level comparison.
 #
 # Branch logic:
 #   1. Neither exists        → skip
@@ -766,6 +799,7 @@ sync_config_file() {
     local REPO_FILE="$1"
     local LOCAL_FILE="$2"
     local LABEL="$3"
+    local NORM="${4:-}"
 
     # 只有一边存在：复制到另一边
     if [ ! -f "$REPO_FILE" ] && [ ! -f "$LOCAL_FILE" ]; then return; fi
@@ -789,8 +823,8 @@ sync_config_file() {
         return
     fi
 
-    # 两边都存在：比较内容
-    if cmp -s "$REPO_FILE" "$LOCAL_FILE"; then
+    # 两边都存在：比较内容（memory 模式会忽略 originSessionId 元数据差异）
+    if _files_equivalent "$REPO_FILE" "$LOCAL_FILE" "$NORM"; then
         echo "  = $LABEL: 无差异"
         CFG_SKIPPED=$((CFG_SKIPPED+1))
         return
@@ -883,7 +917,7 @@ sync_memory_dir() {
 
     while IFS= read -r filename; do
         [ -z "$filename" ] && continue
-        sync_config_file "${DOTFILES_MEMORY}/${filename}" "${CC_MEMORY}/${filename}" "    ${filename}"
+        sync_config_file "${DOTFILES_MEMORY}/${filename}" "${CC_MEMORY}/${filename}" "    ${filename}" "memory"
     done <<< "$ALL_FILES"
     return 0
 }
