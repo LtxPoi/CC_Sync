@@ -44,7 +44,7 @@ After confirmation, run `bash module-manager.sh restore`.
 
 **"安装与管理"** → ask second AskUserQuestion:
 ```json
-{"questions": [{"header": "manage", "question": "选择具体操作：", "multiSelect": false, "options": [{"label": "install", "description": "从 GitHub 安装新模块（需要提供 source）"}, {"label": "remove", "description": "删除已安装模块（目录 + manifest 记录）"}, {"label": "adopt", "description": "将已有目录纳入 manifest 管理（补登记）"}]}]}
+{"questions": [{"header": "manage", "question": "选择具体操作：", "multiSelect": false, "options": [{"label": "install", "description": "从 GitHub 安装新模块（需要提供 source）"}, {"label": "remove", "description": "删除已安装模块（目录 + manifest 记录）"}, {"label": "adopt", "description": "将已有目录纳入 manifest 管理（补登记）"}, {"label": "prune", "description": "清理未管理目录（manifest 同步后留下的孤儿）"}]}]}
 ```
 
 3. Execute the selected operation per the Workflow section below.
@@ -76,6 +76,22 @@ After any install, update, remove, or adopt operation that modifies `modules.tom
 
 ### AskUserQuestion examples
 
+#### Install directory conflict
+
+When `install` exits with code 2 and stderr contains a line starting with `CONFLICT_INSTALL: <path>`, the target directory already exists. Substitute `<path>` from the marker into the question text:
+
+```json
+{"questions": [{"header": "install-conflict", "question": "目标目录已存在: <path>。如何处理？", "multiSelect": false, "options": [{"label": "改名重装", "description": "用 --name <new-name> 安装到新目录（请用户提供新名称）"}, {"label": "删除后重装", "description": "先 rm -rf 现有目录，再重新安装到原位置"}, {"label": "取消", "description": "保留现有目录，不安装"}]}]}
+```
+
+#### Update partial failure
+
+After `update --all` returns with `Failed: N` where N > 0:
+
+```json
+{"questions": [{"header": "update-fail", "question": "有 N 个模块更新失败，如何处理？", "multiSelect": false, "options": [{"label": "按模块重试", "description": "对每个失败模块单独 update <name> 重试"}, {"label": "查看错误", "description": "显示完整错误输出以便诊断"}, {"label": "暂时跳过", "description": "保留当前版本，稍后再处理"}]}]}
+```
+
 #### Restore failure — partial recovery
 
 When `restore` output shows some modules failed to download:
@@ -98,6 +114,14 @@ When `list` shows untracked directories:
 
 ```json
 {"questions": [{"header": "untracked", "question": "Found untracked directories in ~/.claude/skills/. Adopt into manifest?", "multiSelect": true, "options": [{"label": "<dir-name>", "description": "Track as managed module (will need source info)"}, {"label": "Skip all", "description": "Leave untracked for now"}]}]}
+```
+
+#### Prune confirmation
+
+After running `bash module-manager.sh prune` and receiving a non-empty list of untracked directories:
+
+```json
+{"questions": [{"header": "prune", "question": "发现 N 个未管理目录，如何处理？(列表见上方脚本输出)", "multiSelect": false, "options": [{"label": "全部清理", "description": "删除所有列出的目录（用于 manifest 同步后的孤儿清理）"}, {"label": "保留部分清理", "description": "请用户输入要保留的目录名（如 codemap），其余删除"}, {"label": "取消", "description": "保持现状，不清理"}]}]}
 ```
 
 ## Core Concepts
@@ -196,6 +220,28 @@ Downloads and installs all modules from manifest. Used for new device setup. **M
 
 If some modules fail (network issues), show the script's error output verbatim. List possible causes (proxy config, API rate limit, repo not found) for user to judge — do not diagnose on their behalf.
 
+### Prune Untracked Directories: `prune`
+
+Clean up directories under `~/.claude/skills/` that are NOT in `modules.toml`. Typical use case: after another machine removed entries from the manifest and `/sync` propagated the change, this machine still has the orphaned folders.
+
+Step 1 — list candidates:
+
+```bash
+bash module-manager.sh prune
+```
+
+The script prints one untracked directory name per line (parsing contract). Show output verbatim. If empty: tell the user there is nothing to prune and stop.
+
+Step 2 — ask the user how to proceed via the `prune` AskUserQuestion template (Critical Rules § Prune confirmation).
+
+Step 3 — execute based on selection:
+
+- **全部清理** → run `bash module-manager.sh prune --all`. The script re-derives the list and deletes each directory. Show output verbatim.
+- **保留部分清理** → ask the user (free text) for directory names to KEEP (e.g., user-authored skills like `codemap`). Compute the delete list as `(listed candidates) − (user keep list)`, then run `bash module-manager.sh prune --confirm <name1> <name2> ...`. Show output verbatim.
+- **取消** → stop, do not call the script again.
+
+The script refuses to delete any name still present in `modules.toml` and rejects names with path-traversal characters; both surface as per-line errors in the output.
+
 ## Error Handling
 
 **Network errors:** Check stderr, consider proxy configuration. Suggest setting `HTTPS_PROXY` or retrying.
@@ -210,6 +256,8 @@ If some modules fail (network issues), show the script's error output verbatim. 
 
 - **Script path is relative**: `module-manager.sh` is at project root — execute as-is, do not rewrite to absolute paths
 - **Manifest is the source of truth**: managed modules must NOT be stored as file copies in dotfiles/skills/. Only `modules.toml` syncs via dotfiles; actual module files are installed by `restore` on each device
+- **`prune --all` requires explicit user confirmation**: only call after running `prune` (list-only) and obtaining "全部清理" via AskUserQuestion. Direct invocation without confirmation can delete user-authored custom skills
+- **Marker contracts**: `CONFLICT_INSTALL: <path>` (stderr from `install` exit 2) and `prune`'s line-per-directory stdout are interface contracts with this skill — changes must update both sides
 
 ## Experience Log
 

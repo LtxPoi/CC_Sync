@@ -574,6 +574,21 @@ def cmd_manifest_delete_module():
     json.dump(data, sys.stdout, ensure_ascii=False)
 
 
+def cmd_list_untracked():
+    """Print untracked directories in skills_dir, one per line.
+    Args: argv[2] = manifest JSON string; argv[3] = skills_dir path.
+    Output is the parsing contract for module-manager.sh's `prune` command."""
+    data = json.loads(sys.argv[2])
+    modules = data.get("modules", {})
+    skills_dir = sys.argv[3]
+    tracked_paths = {mod.get("install_path", name) for name, mod in modules.items()}
+    if os.path.isdir(skills_dir):
+        for d in sorted(os.listdir(skills_dir)):
+            full = os.path.join(skills_dir, d)
+            if os.path.isdir(full) and d not in tracked_paths and not d.startswith("."):
+                print(d)
+
+
 def cmd_restore_count():
     """Print total number of modules in manifest. JSON stdin."""
     data = _read_json_stdin()
@@ -622,6 +637,7 @@ COMMANDS = {
     "manifest-delete-module": cmd_manifest_delete_module,
     "restore-count": cmd_restore_count,
     "restore-list-missing": cmd_restore_list_missing,
+    "list-untracked": cmd_list_untracked,
 }
 
 

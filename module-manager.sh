@@ -12,6 +12,7 @@
 #   adopt <name> <source>       Track an existing directory in the manifest
 #   adopt --bulk <owner/repo>   Bulk-adopt matching directories
 #   restore                     Download all modules from manifest (new device)
+#   prune [--all|--confirm N..] List/delete untracked directories
 
 set -euo pipefail
 
@@ -353,6 +354,9 @@ cmd_install() {
     # Check for conflict
     if [[ -d "$dest" ]]; then
         echo -e "${RED}错误：目录已存在：$dest${NC}" >&2
+        # Marker is the parsing contract with the SKILL.md install-conflict flow.
+        # Changing the prefix is a breaking change — update both sides together.
+        echo "CONFLICT_INSTALL: $dest" >&2
         exit 2
     fi
 
@@ -629,6 +633,98 @@ cmd_restore() {
     echo "Restored: $restored, Failed: $failed, Already present: $((total - restored - failed))"
 }
 
+cmd_prune() {
+    local mode="list"
+    local names=()
+
+    case "${1:-}" in
+        --all)
+            mode="all"
+            ;;
+        --confirm)
+            mode="confirm"
+            shift
+            names=("$@")
+            if [[ ${#names[@]} -eq 0 ]]; then
+                echo "用法：module-manager.sh prune --confirm <name>..." >&2
+                exit 1
+            fi
+            ;;
+        "")
+            mode="list"
+            ;;
+        *)
+            echo "用法：module-manager.sh prune [--all | --confirm <name>...]" >&2
+            exit 1
+            ;;
+    esac
+
+    local data
+    data=$(manifest_json)
+
+    if [[ "$mode" == "list" ]]; then
+        py_helper list-untracked "$data" "$SKILLS_DIR"
+        return
+    fi
+
+    if [[ "$mode" == "all" ]]; then
+        local untracked
+        untracked=$(py_helper list-untracked "$data" "$SKILLS_DIR")
+        if [[ -z "$untracked" ]]; then
+            echo -e "${GREEN}✓${NC} 没有未管理目录，无需清理。"
+            return 0
+        fi
+        local removed=0 errors=0
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            if ! _validate_module_name "$name" 2>/dev/null; then
+                echo -e "  ${RED}✗${NC} ${name}: 名称非法，跳过"
+                errors=$((errors + 1))
+                continue
+            fi
+            local dest="${SKILLS_DIR}/${name}"
+            if [[ -d "$dest" ]]; then
+                rm -rf "$dest"
+                echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
+                removed=$((removed + 1))
+            else
+                echo -e "  ${YELLOW}⚠${NC} ${name}: 目录已不存在，跳过"
+            fi
+        done <<< "$untracked"
+        echo ""
+        echo "已清理: $removed, 失败: $errors"
+        return 0
+    fi
+
+    # mode == "confirm"
+    local removed=0 errors=0
+    for name in "${names[@]}"; do
+        if ! _validate_module_name "$name"; then
+            errors=$((errors + 1))
+            continue
+        fi
+        # Refuse to delete a name still tracked in the manifest — caller is confused;
+        # the right command for managed modules is `remove`, which also clears the entry.
+        if [[ "$(module_exists "$data" "$name")" == "yes" ]]; then
+            echo -e "  ${RED}✗${NC} ${name}: 仍在 manifest 中——请使用 remove，而非 prune" >&2
+            errors=$((errors + 1))
+            continue
+        fi
+        local dest="${SKILLS_DIR}/${name}"
+        if [[ ! -d "$dest" ]]; then
+            echo -e "  ${YELLOW}⚠${NC} ${name}: 目录不存在 (${dest})，跳过"
+            continue
+        fi
+        rm -rf "$dest"
+        echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
+        removed=$((removed + 1))
+    done
+    echo ""
+    echo "已清理: $removed, 失败: $errors"
+    [[ $errors -gt 0 ]] && return 1
+    return 0
+}
+
 # ─── Main ─────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -639,6 +735,7 @@ case "${1:-}" in
     remove)   shift; cmd_remove "$@" ;;
     adopt)    shift; cmd_adopt "$@" ;;
     restore)  cmd_restore ;;
+    prune)    shift; cmd_prune "$@" ;;
     *)
         echo "module-manager.sh — Third-party module manager"
         echo ""
@@ -651,6 +748,9 @@ case "${1:-}" in
         echo "  adopt <name> <source>       Track existing directory"
         echo "  adopt --bulk <owner/repo>   Bulk-adopt from repo"
         echo "  restore                     Restore from manifest"
+        echo "  prune                       List untracked directories"
+        echo "  prune --all                 Delete all untracked directories"
+        echo "  prune --confirm <name>...   Delete specific untracked directories"
         exit 1
         ;;
 esac
