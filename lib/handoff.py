@@ -109,26 +109,85 @@ def _modify_registry(text, modify_fn):
     return text
 
 
+def _is_fence_line(line):
+    """Line starts a code fence (``` or ~~~ after optional indent)."""
+    stripped = line.lstrip()
+    return stripped.startswith("```") or stripped.startswith("~~~")
+
+
 def add_section(text, name):
-    """Insert a new (none) section before ## ANY and update registry."""
-    new_section = f"## {name}\n\n(none)\n\n"
-    result, count = re.subn(r"(## ANY)", lambda m: new_section + m.group(1), text)
-    if count == 0:
-        raise ValueError("HANDOFF.md 中未找到 '## ANY' 锚点，无法插入新设备节")
+    """Insert a new (none) section before ## ANY and update registry.
+
+    Uses line-by-line scanning that SKIPS markdown fenced code blocks (``` or ~~~),
+    so a literal "## ANY" appearing inside a code example in a task body cannot be
+    matched (the older regex approach couldn't tell fence-inside from real header).
+    Only the first non-fenced `## ANY` at start-of-line is used.
+
+    Also rejects names containing newlines (sync.sh wraps with `tr -d '\r\n'` but
+    direct Python callers need defense-in-depth).
+    """
+    if "\n" in name or "\r" in name:
+        raise ValueError("设备名不能包含换行字符")
+    new_section_lines = [f"## {name}", "", "(none)", ""]
+    lines = text.split("\n")
+    in_code_fence = False
+    insert_index = None
+    for i, line in enumerate(lines):
+        if _is_fence_line(line):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        if line.rstrip() == "## ANY":
+            insert_index = i
+            break
+    if insert_index is None:
+        raise ValueError("HANDOFF.md 中未找到 '## ANY' 锚点（或仅在代码块内），无法插入新设备节")
+    # Insert new-section block + trailing blank line before the ## ANY line
+    lines[insert_index:insert_index] = new_section_lines + [""]
+    result = "\n".join(lines)
     # Update registry
     result = _modify_registry(result, lambda reg: reg if name in reg else reg + [name])
     return result
 
 
 def remove_section(text, name):
-    """Remove a section, normalize whitespace, and update registry."""
-    boundary = _build_boundary_pattern(text)
-    pattern = rf"(?m)^## {re.escape(name)}\s*\n.*?{boundary}"
-    text = re.sub(pattern, "", text, flags=re.DOTALL | re.MULTILINE)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    """Remove a section, normalize whitespace, and update registry.
+
+    Uses line-by-line scanning + code-fence tracking to avoid matching a literal
+    ## Name line that appears inside a code fenced block (which would corrupt
+    unrelated content).
+    """
+    lines = text.split("\n")
+    in_code_fence = False
+    # Collect device-section-header indices (non-fenced `## <Name>` lines)
+    boundary_indices = []
+    target_index = None
+    target_header = f"## {name}"
+    for i, line in enumerate(lines):
+        if _is_fence_line(line):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        stripped = line.rstrip()
+        if stripped.startswith("## "):
+            boundary_indices.append(i)
+            if stripped == target_header and target_index is None:
+                target_index = i
+    if target_index is None:
+        # Nothing to remove; still normalize whitespace + registry for idempotency
+        result = re.sub(r"\n{3,}", "\n\n", text)
+        return _modify_registry(result, lambda reg: [n for n in reg if n != name])
+    # Find the next non-fenced ## header after target_index (section end)
+    next_boundaries = [b for b in boundary_indices if b > target_index]
+    end_index = next_boundaries[0] if next_boundaries else len(lines)
+    del lines[target_index:end_index]
+    result = "\n".join(lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
     # Update registry
-    text = _modify_registry(text, lambda reg: [n for n in reg if n != name])
-    return text
+    result = _modify_registry(result, lambda reg: [n for n in reg if n != name])
+    return result
 
 
 def list_devices(text):

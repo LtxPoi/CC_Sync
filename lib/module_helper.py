@@ -11,10 +11,13 @@ All arguments are passed via sys.argv (no bash string interpolation).
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.request
+from urllib.parse import quote, urlparse
 
 # ── encoding safety (Windows defaults to GBK) ──────────────────────
 sys.stdout.reconfigure(encoding="utf-8")
@@ -31,11 +34,11 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
     gh_cmd = os.environ.get("GH_CMD", "gh")
     # Extract owner/repo/ref/path from raw.githubusercontent.com URL
     # Format: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}
-    import re as _re
-    m = _re.match(r"https://raw\.githubusercontent\.com/([^/]+/[^/]+)/([^/]+)/(.*)", url)
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
     if m:
-        repo, ref, path = m.group(1), m.group(2), m.group(3)
-        api_url = f"repos/{repo}/contents/{path}?ref={ref}"
+        repo = f"{m.group(1)}/{m.group(2)}"
+        ref, path = m.group(3), m.group(4)
+        api_url = f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}"
         try:
             result = subprocess.run(
                 [gh_cmd, "api", api_url, "--header", "Accept: application/vnd.github.raw+json"],
@@ -51,6 +54,12 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
             pass  # gh not available or timed out, fall back to urllib
 
     # Fallback: direct urllib download (unauthenticated)
+    # Only allow HTTPS from trusted GitHub domains (prevent SSRF via crafted API responses)
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc.endswith(
+        (".githubusercontent.com", ".github.com")
+    ):
+        raise ValueError(f"Untrusted download URL: {url}")
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         total = 0
@@ -68,8 +77,14 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
 # ── TOML helpers ────────────────────────────────────────────────────
 
 def _toml_escape(s):
-    """Escape a string for TOML double-quoted values."""
-    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a string for TOML double-quoted values (incl. control chars)."""
+    s = str(s)
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", "\\n")
+    s = s.replace("\r", "\\r")
+    s = s.replace("\t", "\\t")
+    return s
 
 
 # ── Shared: fetch latest SHAs from GitHub ───────────────────────────
@@ -90,23 +105,34 @@ def _fetch_latest_shas(modules, target, gh):
             return None, None, None  # signal "not found"
         modules = {target: modules[target]}
 
-    # Group by repo@ref to minimise API calls
+    # Group by (repo, ref, path) tuple for path-specific SHA queries
     repos = {}
     for name, mod in modules.items():
         src = mod.get("source", {})
         repo = src.get("repo", "")
         ref = src.get("ref", DEFAULT_REF)
+        kind = src.get("kind", "")
+        # Only use path for github-subdir modules (github-repo may have stale path values)
+        path = src.get("path", "") if kind == "github-subdir" else ""
         if repo:
-            key = f"{repo}@{ref}"
+            key = (repo, ref, path)
             repos.setdefault(key, []).append((name, mod))
 
     updates, up_to_date, errors = [], [], []
 
-    for key, mods in repos.items():
-        repo, ref = key.rsplit("@", 1)
+    for (repo, ref, path), mods in repos.items():
         try:
+            if path:
+                # Path-specific query: latest commit touching this subdirectory
+                cmd = [gh, "api",
+                       f"repos/{repo}/commits?sha={quote(ref, safe='')}&path={quote(path, safe='/')}&per_page=1",
+                       "-q", ".[0].sha"]
+            else:
+                # Whole-repo query (github-repo kind or no path)
+                cmd = [gh, "api",
+                       f"repos/{repo}/commits/{quote(ref, safe='')}", "-q", ".sha"]
             result = subprocess.run(
-                [gh, "api", f"repos/{repo}/commits/{ref}", "-q", ".sha"],
+                cmd,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -117,6 +143,11 @@ def _fetch_latest_shas(modules, target, gh):
                     errors.append((name, result.stderr.strip()))
                 continue
             latest = result.stdout.strip()
+            # Validate SHA format (must be 40-char hex; reject null/empty/error)
+            if not re.fullmatch(r"[0-9a-f]{40}", latest):
+                for name, _ in mods:
+                    errors.append((name, f"Invalid SHA from API: {latest!r}"))
+                continue
             for name, mod in mods:
                 stored = mod.get("commit_sha", "")
                 if stored != latest:
@@ -158,7 +189,8 @@ def cmd_manifest_write():
 
     for name in sorted(data.get("modules", {})):
         mod = data["modules"][name]
-        lines.append(f'[modules."{name}"]')
+        escaped_name = _toml_escape(name)
+        lines.append(f'[modules."{escaped_name}"]')
         for key in ["type", "install_path", "commit_sha", "installed_at", "last_updated"]:
             val = mod.get(key, "")
             if val:
@@ -166,18 +198,27 @@ def cmd_manifest_write():
         lines.append("")
         src = mod.get("source", {})
         if src:
-            lines.append(f'[modules."{name}".source]')
+            lines.append(f'[modules."{escaped_name}".source]')
             for key in ["kind", "repo", "path", "ref", "url"]:
                 val = src.get(key, "")
                 if val:
                     lines.append(f'{key} = "{_toml_escape(val)}"')
             lines.append("")
 
-    dirname = os.path.dirname(manifest)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines))
+    dirname = os.path.dirname(manifest) or "."
+    os.makedirs(dirname, exist_ok=True)
+    # Atomic write: write to temp file, then replace (prevents truncation on crash)
+    fd, tmp_path = tempfile.mkstemp(dir=dirname, suffix=".toml.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines))
+        os.replace(tmp_path, manifest)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def cmd_json_to_vars():
@@ -214,7 +255,7 @@ def cmd_manifest_add_module():
         source["repo"] = repo
     if path:
         source["path"] = path
-    data["modules"][name] = {
+    data.setdefault("modules", {})[name] = {
         "type": MODULE_TYPE,
         "install_path": name,
         "commit_sha": sha,
@@ -236,7 +277,7 @@ def cmd_download_github_subdir():
     def download_dir(repo, path, ref, dest):
         os.makedirs(dest, exist_ok=True)
         result = subprocess.run(
-            [gh, "api", f"repos/{repo}/contents/{path}?ref={ref}", "-q", "."],
+            [gh, "api", f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}", "-q", "."],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -251,12 +292,32 @@ def cmd_download_github_subdir():
             items = [items]
 
         ok = True
+        resolved_dest = os.path.realpath(dest)
         for item in items:
-            name = item["name"]
-            if item["type"] == "dir":
-                if not download_dir(repo, item["path"], ref, os.path.join(dest, name)):
+            # Defensive: GitHub API could return malformed entries (schema drift,
+            # partial truncation, forked API). .get() + skip-on-missing instead of
+            # raw subscript that KeyErrors and aborts the entire download batch.
+            raw_name = item.get("name") if isinstance(item, dict) else None
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if not raw_name or not item_type:
+                print(f"  Skipped (malformed item, missing name/type): {item!r}", file=sys.stderr)
+                continue
+            # Sanitize filename to prevent path traversal from API responses.
+            # os.path.basename is cross-platform: on POSIX it strips up to last "/",
+            # on Windows (ntpath) it strips up to last "\" OR "/" — both are safe
+            # against "foo/bar" or "..\\x" style injection. The (".", "..") guard
+            # covers the remaining dot-entries that basename alone lets through.
+            name = os.path.basename(raw_name)
+            if not name or name in (".", ".."):
+                continue
+            target = os.path.realpath(os.path.join(dest, name))
+            if not target.startswith(resolved_dest + os.sep):
+                print(f"  Skipped (path traversal): {raw_name}", file=sys.stderr)
+                continue
+            if item_type == "dir":
+                if not download_dir(repo, item.get("path", ""), ref, os.path.join(dest, name)):
                     ok = False
-            elif item["type"] == "file":
+            elif item_type == "file":
                 url = item.get("download_url", "")
                 if not url:
                     continue
@@ -398,7 +459,7 @@ def cmd_update_check():
                 {
                     "name": name,
                     "latest_sha": latest,
-                    "kind": src.get("kind"),
+                    "kind": src.get("kind", ""),
                     "repo": src.get("repo", ""),
                     "path": src.get("path", ""),
                     "ref": src.get("ref", DEFAULT_REF),
@@ -412,6 +473,9 @@ def cmd_manifest_update_sha():
     """Update commit_sha and last_updated for a module. JSON stdin -> JSON stdout."""
     name, sha, today = sys.argv[2], sys.argv[3], sys.argv[4]
     data = json.load(sys.stdin)
+    if name not in data.get("modules", {}):
+        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        sys.exit(1)
     data["modules"][name]["commit_sha"] = sha
     data["modules"][name]["last_updated"] = today
     json.dump(data, sys.stdout, ensure_ascii=False)
@@ -421,6 +485,9 @@ def cmd_module_get_path():
     """Print install_path for a module. JSON stdin."""
     data = json.load(sys.stdin)
     name = sys.argv[2]
+    if name not in data.get("modules", {}):
+        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        sys.exit(1)
     print(data["modules"][name].get("install_path", name))
 
 
@@ -428,6 +495,9 @@ def cmd_manifest_delete_module():
     """Delete a module from manifest JSON. stdin -> stdout."""
     data = json.load(sys.stdin)
     name = sys.argv[2]
+    if name not in data.get("modules", {}):
+        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        sys.exit(1)
     del data["modules"][name]
     json.dump(data, sys.stdout, ensure_ascii=False)
 

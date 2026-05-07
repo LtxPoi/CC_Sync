@@ -6,13 +6,20 @@ user_invocable: true
 
 # Sync — Multi-Repo Sync (Hybrid Mode)
 
-> This skill’s output parsing logic is based on the current sync.sh version. If sync.sh output format changes, update this file accordingly.
+> This skill's output parsing logic is based on the current sync.sh version. If sync.sh output format changes, update this file accordingly.
+
+## Not For
+
+- Repos without the `claude-code-workspace` topic (those are intentionally excluded via topic filter or `.sync_ignore`)
+- Public Claude-Code-tool repos like CC_Sync (managed via dedicated sessions, not sync.sh discovery)
+- Non-git directories (sync.sh requires git repos)
+- Cross-repo code changes — sync.sh is transport only, not refactoring
 
 ## Critical Rules
 
-### AskUserQuestion is MANDATORY for interactive decisions
+### Call AskUserQuestion for interactive decisions
 
-When sync.sh output contains `===CONFLICT_BEGIN===` blocks or `NEW_REPO:` markers, call the AskUserQuestion tool with structured options.
+When sync.sh output contains `===CONFLICT_BEGIN===` blocks, `===UNTRACKED_BEGIN===` blocks, or `NEW_REPO:` markers, call the AskUserQuestion tool with structured options rather than asking in free-form chat.
 
 **WRONG** (never do this):
 - Printing conflict details as text and asking "你想保留哪个版本？" in conversation
@@ -20,7 +27,7 @@ When sync.sh output contains `===CONFLICT_BEGIN===` blocks or `NEW_REPO:` marker
 - Summarizing "发现 2 个冲突" without presenting structured choices
 - Asking "要我帮你处理吗？" instead of directly presenting the tool UI
 
-**RIGHT**: For every `===CONFLICT_BEGIN===` block and `NEW_REPO:` marker, call AskUserQuestion immediately.
+**RIGHT**: For every `===CONFLICT_BEGIN===` block, `===UNTRACKED_BEGIN===` block, or `NEW_REPO:` marker, call AskUserQuestion immediately.
 
 #### CONFLICT example call
 
@@ -29,8 +36,8 @@ When output contains a structured conflict block:
 ```
 ===CONFLICT_BEGIN===
 LABEL: settings.json
-REPO: /c/dotfiles/claude/settings.json
-LOCAL: /c/Users/user/.claude/settings.json
+REPO: <dotfiles-path>/claude/settings.json
+LOCAL: ~/.claude/settings.json
 REPO_TIME: 2025-04-07 14:32
 LOCAL_TIME: 2025-04-08 09:15
 DIFF:
@@ -52,7 +59,7 @@ Parse each field from the block, then call AskUserQuestion:
 Field mapping:
 - `LABEL` → `question` text and `header` (trim whitespace, strip extension, truncate to 12 chars if needed)
 - `REPO_TIME` / `LOCAL_TIME` → option `description` timestamps
-- `DIFF` lines (strip 8-space indent) → option `preview` content
+- `DIFF` lines (strip exact 8-space indent) → option `preview` content. The first line of DIFF is an intentional direction-hint ("lines starting with '-' show the REPO version...") — pass it through verbatim so the reader doesn't need to decode `-`/`+`.
 - `REPO` / `LOCAL` → used in post-resolution `cp` commands (see Workflow § CONFLICT)
 
 #### NEW_REPO example call
@@ -62,7 +69,7 @@ When output contains: `NEW_REPO: my-project | https://github.com/user/my-project
 Read `WORKSPACE_ROOTS` from `.env` (semicolon-separated paths) to build options:
 
 ```json
-{"questions": [{"header": "my-project", "question": "New repo my-project not found locally. Clone to which directory?", "multiSelect": false, "options": [{"label": "C:/Claude_code_cli", "description": "Clone to workspace root C:/Claude_code_cli/my-project"}, {"label": "Skip", "description": "Do nothing now, will ask again on next sync"}, {"label": "Ignore permanently", "description": "Add to .sync_ignore, never ask again"}]}]}
+{"questions": [{"header": "my-project", "question": "New repo my-project not found locally. Clone to which directory?", "multiSelect": false, "options": [{"label": "<workspace-root>", "description": "Clone to workspace root <workspace-root>/my-project"}, {"label": "Ask again next sync", "description": "Do nothing now; this new-repo prompt will reappear on the next /sync"}, {"label": "Ignore permanently", "description": "Add to .sync_ignore, never ask again"}]}]}
 ```
 
 Adapt options count to actual WORKSPACE_ROOTS entries (max 4 options total including Skip/Ignore).
@@ -94,16 +101,29 @@ Field mapping:
 - `REPO_PATH` → absolute path used as `cd` target for post-resolution commands
 - Each `FILE` line (strip 8-space indent) → one AskUserQuestion question
 
-After ALL UNTRACKED questions resolved (across all repos), execute in each repo's REPO_PATH:
-1. Apply per-file choice:
+After ALL UNTRACKED questions resolved (across all repos), `cd "$REPO_PATH"` for each repo (quote — paths may contain spaces), then:
+1. Track a per-repo flag `NEVER_AGAIN=0`. Apply each file's choice:
    - **Include**: `git add "<file>"`
    - **Ask again next sync**: no action (file stays untracked)
-   - **Never ask again**: `echo "<file>" >> .gitignore` (exact path, not pattern)
-2. Stage tracked modifications (excluding .gitignore): `git add -u -- ':!.gitignore'`
+   - **Never ask again**: ensure `.gitignore` ends with a newline before appending, then append the exact path, then set `NEVER_AGAIN=1`:
+     ```bash
+     if [ -f .gitignore ] && [ -n "$(tail -c 1 .gitignore 2>/dev/null)" ]; then echo "" >> .gitignore; fi
+     echo "<file>" >> .gitignore
+     ```
+     Before appending, check the filename for gitignore footguns — see Gotchas.
+2. Stage tracked modifications (excluding `.gitignore`): `git add -u -- ':!.gitignore'`
 3. If anything is staged (`git diff --cached --quiet` returns non-zero): commit with mechanical message `sync: auto commit from <hostname>` and push.
-4. If `.gitignore` has unstaged modifications from "Never ask again" choices: `git add .gitignore && git commit -m "chore(.gitignore): 忽略 sync 扫描到的未跟踪文件" && git push` as a separate second commit.
+4. If `NEVER_AGAIN=1` for this repo: first check whether `.gitignore` had pre-existing uncommitted changes BEFORE Claude touched it. Check with this exact command (the HEAD comparison catches both unstaged AND staged-but-not-committed changes):
+   ```bash
+   git diff --quiet HEAD -- .gitignore 2>/dev/null
+   ```
+   `0` exit = clean-before, safe to auto-commit. Non-zero exit = dirty-before (or untracked with content), unsafe.
+   - **Clean-before**: run `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push` as a separate second commit.
+   - **Dirty-before**: write the never-again entries to `.gitignore` but SKIP the auto-commit — warn the user to commit the combined diff manually so pre-existing edits don't get misattributed to sync.
 
-If nothing is staged after step 2 (user chose "Ask again" for all files and the repo had no tracked modifications), no commit is made — this is correct, not an error.
+   **Do NOT** use `git diff --quiet .gitignore` (without `HEAD`) — that compares worktree to index and misses staged-but-not-committed changes. **Do NOT** gate only on that dirty-check without the `NEVER_AGAIN` flag — that would fire the commit whenever the file is dirty (including purely user-made edits) and misattribute them.
+
+If nothing is staged after step 2 and `NEVER_AGAIN=0` (user chose "Ask again" for everything and no tracked modifications existed), no commit is made — this is correct, not an error.
 
 ### Commit message rule
 
@@ -124,7 +144,7 @@ test -f .env && echo "exists" || echo "missing"
 - Tell the user to run `bash sync.sh` in an **interactive terminal** (e.g., Git Bash) to complete setup
 - The wizard guides through dotfiles path, repo sync toggle, etc.
 - After setup, /sync works normally in CC
-- **Do NOT attempt to run sync.sh from CC to complete first-run setup**
+- First-run setup requires an interactive terminal; the CC Bash tool cannot drive the wizard
 
 **If .env exists, proceed to Step 1.**
 
@@ -142,6 +162,7 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 - Display everything after the `[4/6]` summary marker verbatim — do not reformat, wrap in code blocks, or build a new table
 - If output contains **missing plugins detected**, show list and install commands, prompt user to run in Claude Code
 - If output contains **===CONFLICT_BEGIN===** blocks, enter conflict resolution flow (below)
+- If output contains **===UNTRACKED_BEGIN===** blocks, enter untracked-file resolution flow (below) — these repos are PENDING user input, NOT complete
 - If output contains **NEW_REPO:** markers, enter new repo handling flow (below)
 - If output contains **HANDOFF: Pending tasks detected**, proceed to Step 3
 - Otherwise, task complete
@@ -154,15 +175,15 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 
 **NEW_REPO: markers** → Follow Critical Rules § NEW_REPO example. Call AskUserQuestion. Then execute:
 - Path chosen: `git clone <url> <path>/<name>`
-- Skip: no action (asks again next sync)
+- Ask again next sync: no action (the new-repo prompt reappears on the next /sync)
 - Ignore permanently: `echo <name> >> .sync_ignore`
 
-**===UNTRACKED_BEGIN=== blocks** → Follow Critical Rules § UNTRACKED example. Ask AskUserQuestion per file (max 4 per call; batch across repos if more). Then per-file in the repo's REPO_PATH:
+**===UNTRACKED_BEGIN=== blocks** → Follow Critical Rules § UNTRACKED example. Ask AskUserQuestion per file (max 4 per call; batch across repos if more). Then `cd "$REPO_PATH"` (quote — paths may contain spaces) for each repo, track a per-repo `NEVER_AGAIN=0` flag, and per-file:
 - Include: `git add "<file>"`
 - Ask again next sync: no action
-- Never ask again: `echo "<file>" >> .gitignore`
+- Never ask again: ensure trailing newline on `.gitignore`, append exact path (see Critical Rules § UNTRACKED for the exact snippet), set `NEVER_AGAIN=1` for this repo
 
-Per repo after all per-file actions: `git add -u -- ':!.gitignore'`, then commit + push with mechanical message if anything staged. If `.gitignore` was modified, second commit with descriptive Chinese message + push.
+Per repo after all per-file actions: `git add -u -- ':!.gitignore'`, then commit + push with mechanical message `sync: auto commit from <hostname>` if anything staged. If the per-repo `NEVER_AGAIN=1`, make a separate second commit: `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push`. Do NOT gate the second commit on `git diff --quiet .gitignore` — that captures pre-existing user edits and misattributes them.
 
 **If script partially failed (exit code 1):**
 - Display `[4/6]` summary verbatim first, then explain failures
@@ -182,7 +203,7 @@ Per repo after all per-file actions: `git add -u -- ':!.gitignore'`, then commit
 4. Execute each:
    - Shell commands: run directly
    - User-action steps: prompt user
-   - On failure: explain, never skip silently
+   - On failure: explain rather than skip silently
 5. After completion: replace device section with `(none)`. `## ANY`: only clear if ALL tasks done; keep tasks for other devices
 6. Commit and push (e.g., `HANDOFF: <device> tasks completed, cleared`)
 
@@ -204,11 +225,16 @@ Username via `gh api user -q .login`. Next /sync auto-discovers.
 ## Gotchas
 
 - **CRLF phantom diffs**: Windows pull/rebase may produce false diffs. Verify with `git diff --stat` before treating as real conflicts.
-- **gh CLI ignores system proxy**: Most common failure in restricted networks. Set `HTTPS_PROXY` manually.
+- **gh CLI ignores Windows system proxy**: gh honors `HTTP_PROXY`/`HTTPS_PROXY` env vars but ignores the Windows system-wide (WinHTTP) proxy setting — in restricted networks, set the env vars explicitly in the shell where sync runs.
 - **Output format dependency**: Step 2 relies on `[4/6]` marker. Update this file if sync.sh format changes.
 - **Handoff trigger**: Step 3 triggered by `HANDOFF: Pending tasks detected`. Device checks done by sync.sh step [5/6].
 - **Plugin detection**: After syncing settings.json, script compares `enabledPlugins` vs `installed_plugins.json`. Claude cannot run `claude plugin` from bash — prompt user.
-- **UNTRACKED marker deferral**: When `===UNTRACKED_BEGIN===` blocks appear in the output, sync.sh has NOT committed or pushed that repo — it's waiting for SKILL.md to resolve via AskUserQuestion and execute the commit. The repo's summary line will read `未跟踪文件待决定`; this is pending user input, not an error. Complete the UNTRACKED flow before treating /sync as done.
+- **UNTRACKED marker deferral**: When `===UNTRACKED_BEGIN===` blocks appear in the output, sync.sh has NOT committed or pushed that repo — it's waiting for SKILL.md to resolve via AskUserQuestion and execute the commit. The repo's summary line will read `未跟踪文件待决定` and appear under the yellow "待决定" group; this is pending user input, not an error. Complete the UNTRACKED flow before treating /sync as done.
+- **Marker payload indent is an interface contract**: CONFLICT's DIFF content (including the direction-hint line), UNTRACKED's FILES list, and any other future indented payload all use exact 8-space leading indent. Parsers strip exactly 8 spaces per line. Changing the indent width in sync.sh is a breaking change — update both sides in one commit.
+- **.gitignore append footguns**: When executing "Never ask again", the filename is written verbatim to `.gitignore`. Filenames starting with `!` act as gitignore NEGATION rules (matching a prior ignore pattern) — if the user really wants such a file ignored, prefix the line with `\`. Filenames with trailing whitespace won't self-match (gitignore treats trailing whitespace as significant unless escaped) — warn or reject. Surface these to the user before append.
+- **Ctrl+C during sync atomicity**: If the user interrupts sync.sh between `git add` and `git commit`, the repo is left with staged changes and no commit. The next /sync will re-surface the same untracked files, and `git add`-ed files will appear as tracked modifications. There is also a second vulnerable window in the two-commit path: between the first commit (`sync: auto commit from <host>`) and the optional second commit (`sync: auto-append .gitignore ...`). Interrupting there leaves `.gitignore` with orphaned unstaged modifications that the next sync's `git add .gitignore` would sweep into a later commit. Recovery is manual (`git reset HEAD` to unstage, `git checkout .gitignore` to discard). Bash scripts can't atomically wrap these operations; document but don't attempt auto-rollback.
+- **No "un-never-again" affordance**: Once a file is appended to `.gitignore` via the Never-ask-again option, sync has no command to reverse it. To re-include the file, the user must manually delete the line from `.gitignore` and run /sync again.
+- **Legacy .env auto-migration**: `sync.sh` runs `_migrate_legacy_env` before `source .env` (startup). It detects legacy `KEY="value"` / unquoted lines, rewrites them with `shlex.quote` via atomic `mkstemp + os.replace`, and logs migrated keys to stderr. Extra warnings fire when a value contains `$` or backtick (previously expanded by `source`, now literal) or contains multiple whitespace-separated tokens (original line kept; needs manual quoting). If a user relied on shell expansion intentionally, they must restore the expansion manually after seeing the warning.
 
 ## Experience Log
 
