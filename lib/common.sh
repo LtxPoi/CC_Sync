@@ -19,7 +19,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 GRAY='\033[90m'
 
-# --- 工作区根目录（CC_General 的父目录）---
+# --- 工作区根目录（脚本所在目录的父目录）---
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- GitHub topic 常量 ---
@@ -77,7 +77,7 @@ get_machine_name() {
 }
 
 # --- 计算 CC 项目哈希（绝对路径 → ~/.claude/projects/ 下的目录名）---
-# CC 将路径中的 : \ _ / 全部替换为 -，如 D:\Claude_Code\CC_General → D--Claude-Code-CC-General
+# CC 将路径中的 : \ _ / 全部替换为 -，如 D:\workspace\my-project → D--workspace-my-project
 compute_cc_hash() {
     local p
     p=$(normalize_path "${1%/}")
