@@ -78,15 +78,15 @@ After any install, update, remove, or adopt operation that modifies `modules.tom
 
 #### Install directory conflict
 
-When `install` exits with code 2 and stderr contains a line starting with `CONFLICT_INSTALL: <path>`, the target directory already exists. Substitute `<path>` from the marker into the question text:
+When `install` exits with code 2 and stderr contains a line starting with `CONFLICT_INSTALL: <path>`, the target path already exists (file, dir, or symlink — same marker). Substitute `<path>` from the marker into the question text:
 
 ```json
-{"questions": [{"header": "install-conflict", "question": "目标目录已存在: <path>。如何处理？", "multiSelect": false, "options": [{"label": "改名重装", "description": "用 --name <new-name> 安装到新目录（请用户提供新名称）"}, {"label": "删除后重装", "description": "先 rm -rf 现有目录，再重新安装到原位置"}, {"label": "取消", "description": "保留现有目录，不安装"}]}]}
+{"questions": [{"header": "install-conflict", "question": "目标路径已存在: <path>。如何处理？", "multiSelect": false, "options": [{"label": "改名重装", "description": "改名安装到新目录（接下来会问你想用什么名字）"}, {"label": "删除后重装", "description": "先 rm -rf 现有路径，再重新安装到原位置"}, {"label": "取消", "description": "保留现有内容，不安装"}]}]}
 ```
 
 #### Update partial failure
 
-After `update --all` returns with `Failed: N` where N > 0:
+After `update --all` returns with `Failed: N` where N > 0. Substitute `N` with the actual failure count before calling AskUserQuestion:
 
 ```json
 {"questions": [{"header": "update-fail", "question": "有 N 个模块更新失败，如何处理？", "multiSelect": false, "options": [{"label": "按模块重试", "description": "对每个失败模块单独 update <name> 重试"}, {"label": "查看错误", "description": "显示完整错误输出以便诊断"}, {"label": "暂时跳过", "description": "保留当前版本，稍后再处理"}]}]}
@@ -110,18 +110,18 @@ Before executing `remove`. Substitute `<name>` with the actual module name in bo
 
 #### Untracked directory adoption
 
-When `list` shows untracked directories:
+When `list` shows untracked directories. Replace the single `<dir-name>` option with one option per untracked directory listed by the script (use the directory name as the label). `multiSelect: true` already lets the user pick zero entries — that *is* "skip all", no separate option needed:
 
 ```json
-{"questions": [{"header": "untracked", "question": "Found untracked directories in ~/.claude/skills/. Adopt into manifest?", "multiSelect": true, "options": [{"label": "<dir-name>", "description": "Track as managed module (will need source info)"}, {"label": "Skip all", "description": "Leave untracked for now"}]}]}
+{"questions": [{"header": "untracked", "question": "在 ~/.claude/skills/ 下发现未管理目录，纳入 manifest 吗？(不勾选任何项 = 全部跳过)", "multiSelect": true, "options": [{"label": "<dir-name>", "description": "纳入管理（接下来会问对应的 source）"}]}]}
 ```
 
 #### Prune confirmation
 
-After running `bash module-manager.sh prune` and receiving a non-empty list of untracked directories:
+After running `bash module-manager.sh prune` and receiving a non-empty list of untracked directories. Substitute `N` with the actual count from the script's output before calling AskUserQuestion:
 
 ```json
-{"questions": [{"header": "prune", "question": "发现 N 个未管理目录，如何处理？(列表见上方脚本输出)", "multiSelect": false, "options": [{"label": "全部清理", "description": "删除所有列出的目录（用于 manifest 同步后的孤儿清理）"}, {"label": "保留部分清理", "description": "请用户输入要保留的目录名（如 codemap），其余删除"}, {"label": "取消", "description": "保持现状，不清理"}]}]}
+{"questions": [{"header": "prune", "question": "发现 N 个未管理目录，如何处理？(列表见上方脚本输出)", "multiSelect": false, "options": [{"label": "全部清理", "description": "删除所有列出的目录（用于 manifest 同步后的孤儿清理）"}, {"label": "保留部分清理", "description": "保留指定目录，其余删除（接下来会问你保留哪些）"}, {"label": "取消", "description": "保持现状，不清理"}]}]}
 ```
 
 ## Core Concepts
@@ -237,7 +237,7 @@ Step 2 — ask the user how to proceed via the `prune` AskUserQuestion template 
 Step 3 — execute based on selection:
 
 - **全部清理** → run `bash module-manager.sh prune --all`. The script re-derives the list and deletes each directory. Show output verbatim.
-- **保留部分清理** → ask the user (free text) for directory names to KEEP (e.g., user-authored skills like `codemap`). Compute the delete list as `(listed candidates) − (user keep list)`, then run `bash module-manager.sh prune --confirm <name1> <name2> ...`. Show output verbatim.
+- **保留部分清理** → ask the user for directory names to KEEP (e.g., user-authored skills like `codemap`), one per line OR comma-separated; trim whitespace and ignore empty entries before computing the difference. Compute the delete list as `(listed candidates) − (user keep list)`. **If the resulting delete list is empty**, tell the user there is nothing to delete and stop without invoking the script. Otherwise run `bash module-manager.sh prune --confirm <name1> <name2> ...`. Show output verbatim.
 - **取消** → stop, do not call the script again.
 
 The script refuses to delete any name still present in `modules.toml` and rejects names with path-traversal characters; both surface as per-line errors in the output.

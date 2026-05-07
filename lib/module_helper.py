@@ -15,13 +15,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import urllib.request
 from urllib.parse import quote, urlparse
 
 # ── encoding safety (Windows defaults to GBK) ──────────────────────
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
+# newline="\n" is load-bearing: bash callers that read multi-line stdout via
+# `$(...)` + `read -r` (e.g. cmd_prune --all) preserve any embedded \r and
+# fail downstream regex validation on every line except the last.
+sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+sys.stderr.reconfigure(encoding="utf-8", newline="\n")
 
 DEFAULT_REF = "main"
 MODULE_TYPE = "skill"
@@ -73,6 +77,12 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
                     [gh_cmd, "api", api_url, "--header", "Accept: application/vnd.github.raw+json"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 )
+                # Watchdog: proc.stdout.read blocks indefinitely if gh stalls mid-stream
+                # (network hang). proc.wait(timeout=…) only fires after read returns,
+                # so we need an independent timer to kill a stalled process.
+                watchdog = threading.Timer(timeout, proc.kill)
+                watchdog.daemon = True
+                watchdog.start()
                 try:
                     total = 0
                     with open(out, "wb") as f:
@@ -83,6 +93,11 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
                             total += len(chunk)
                             if total > max_bytes:
                                 proc.kill()
+                                try:
+                                    f.close()
+                                    os.unlink(out)
+                                except OSError:
+                                    pass
                                 raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
                             f.write(chunk)
                     try:
@@ -94,6 +109,7 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
                         return
                     # gh failed; fall through to urllib
                 finally:
+                    watchdog.cancel()
                     if proc.poll() is None:
                         proc.kill()
             except FileNotFoundError:
@@ -116,6 +132,11 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
                     break
                 total += len(chunk)
                 if total > max_bytes:
+                    try:
+                        f.close()
+                        os.unlink(out)
+                    except OSError:
+                        pass
                     raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
                 f.write(chunk)
 
@@ -139,6 +160,10 @@ def _toml_escape(s):
             out.append("\\t")
         elif code < 0x20 or code == 0x7F:
             out.append(f"\\u{code:04x}")
+        elif 0xD800 <= code <= 0xDFFF:
+            # Lone surrogates can't survive UTF-8 encoding on write — replace
+            # rather than crash the atomic write with UnicodeEncodeError.
+            out.append("\\uFFFD")
         else:
             out.append(ch)
     return "".join(out)
@@ -286,14 +311,6 @@ def cmd_manifest_write():
         raise
 
 
-def cmd_json_to_vars():
-    """Parse JSON object -> bash variable assignments. (Legacy, kept for compat.)"""
-    d = json.loads(sys.argv[2])
-    for k, v in d.items():
-        v = str(v).replace("'", "'\"'\"'")
-        print(f"{k}='{v}'")
-
-
 def cmd_tab_vars():
     """Output module fields as tab-separated values in fixed order.
     Reads JSON from stdin (piped from bash via: echo "$json" | py_helper tab-vars).
@@ -414,6 +431,19 @@ def _format_source_str(src):
     return src.get("url", "")[:40]
 
 
+def _list_unmanaged(modules, skills_dir):
+    """Return sorted list of subdirs of skills_dir that aren't tracked in modules."""
+    tracked_paths = {mod.get("install_path", name) for name, mod in modules.items()}
+    if not os.path.isdir(skills_dir):
+        return []
+    return [
+        d for d in sorted(os.listdir(skills_dir))
+        if os.path.isdir(os.path.join(skills_dir, d))
+        and d not in tracked_paths
+        and not d.startswith(".")
+    ]
+
+
 def cmd_list():
     """Print formatted table of tracked modules + detect unmanaged dirs."""
     data = json.loads(sys.argv[2])
@@ -438,13 +468,7 @@ def cmd_list():
         print()
 
     # Detect unmanaged directories
-    tracked_paths = {mod.get("install_path", name) for name, mod in modules.items()}
-    unmanaged = []
-    if os.path.isdir(skills_dir):
-        for d in sorted(os.listdir(skills_dir)):
-            full = os.path.join(skills_dir, d)
-            if os.path.isdir(full) and d not in tracked_paths and not d.startswith("."):
-                unmanaged.append(d)
+    unmanaged = _list_unmanaged(modules, skills_dir)
 
     if unmanaged:
         print(f"Unmanaged directories ({len(unmanaged)}):")
@@ -581,12 +605,8 @@ def cmd_list_untracked():
     data = json.loads(sys.argv[2])
     modules = data.get("modules", {})
     skills_dir = sys.argv[3]
-    tracked_paths = {mod.get("install_path", name) for name, mod in modules.items()}
-    if os.path.isdir(skills_dir):
-        for d in sorted(os.listdir(skills_dir)):
-            full = os.path.join(skills_dir, d)
-            if os.path.isdir(full) and d not in tracked_paths and not d.startswith("."):
-                print(d)
+    for d in _list_unmanaged(modules, skills_dir):
+        print(d)
 
 
 def cmd_restore_count():
@@ -624,7 +644,6 @@ def cmd_restore_list_missing():
 COMMANDS = {
     "manifest-read": cmd_manifest_read,
     "manifest-write": cmd_manifest_write,
-    "json-to-vars": cmd_json_to_vars,
     "tab-vars": cmd_tab_vars,
     "module-exists": cmd_module_exists,
     "manifest-add-module": cmd_manifest_add_module,

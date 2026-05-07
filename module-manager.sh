@@ -34,7 +34,7 @@ _CLEANUP_DIRS=()
 _cleanup_temps() {
     local d
     for d in "${_CLEANUP_DIRS[@]+"${_CLEANUP_DIRS[@]}"}"; do
-        [ -d "$d" ] && rm -rf "$d"
+        [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
     done
 }
 trap _cleanup_temps EXIT INT TERM
@@ -98,8 +98,10 @@ _validate_module_name() {
         echo -e "${RED}错误：无效的模块名 '$name'${NC}" >&2
         return 1
     fi
-    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-        echo -e "${RED}错误：模块名 '$name' 只能包含 A-Z a-z 0-9 _ - . ${NC}" >&2
+    # Require an alphanumeric/underscore lead to keep names from looking like
+    # CLI flags downstream (e.g. "-evil" passed where rm/mv won't get a slash prefix).
+    if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+        echo -e "${RED}错误：模块名 '$name' 只能包含 A-Z a-z 0-9 _ - .（首字符须为字母/数字/下划线）${NC}" >&2
         return 1
     fi
 }
@@ -153,7 +155,7 @@ download_github_repo() {
     if ! git clone --depth 1 --branch "$ref" --single-branch \
          "https://github.com/${repo}.git" "$tmp_clone" 2>/dev/null; then
         echo -e "${RED}✗ Failed to clone branch '$ref' from https://github.com/${repo}.git${NC}" >&2
-        rm -rf "$tmp_clone"
+        rm -rf "$tmp_clone" 2>/dev/null || true
         return 1
     fi
 
@@ -166,7 +168,7 @@ download_github_repo() {
     (set -o pipefail; cd "$tmp_clone" && find . -maxdepth 1 ! -name . ! -name .git ! -type l -print0 \
         | xargs -0 -I '{}' cp -a '{}' "$dest"/) || copy_errors=1
     find "$dest" -type l -delete 2>/dev/null || true
-    rm -rf "$tmp_clone"
+    rm -rf "$tmp_clone" 2>/dev/null || true
     return $copy_errors
 }
 
@@ -187,6 +189,12 @@ _download_to_tmp() {
 
 parse_source() {
     local src="$1"
+    # Reject embedded tabs/newlines: the function emits tab-separated output, so a
+    # tab inside src would shift downstream `IFS=$'\t' read` parsing.
+    if [[ "$src" == *$'\t'* || "$src" == *$'\n'* ]]; then
+        echo -e "${RED}错误：来源字符串不能包含制表符或换行${NC}" >&2
+        return 1
+    fi
     if [[ "$src" == https://* ]]; then
         printf 'url\t\t\t%s' "$src"
     elif [[ "$src" == *:* ]]; then
@@ -234,10 +242,16 @@ cmd_update() {
             echo -e "${RED}✗${NC} Update check failed:" >&2
             cat "$check_stderr" >&2
         fi
-        rm -rf "$check_tmpdir"
+        rm -rf "$check_tmpdir" 2>/dev/null || true
         return $rc
     }
-    rm -rf "$check_tmpdir"
+    # update-check exits 0 even when some modules failed their lookup (per-module
+    # warnings go to stderr). Surface those warnings before proceeding so the user
+    # isn't blind to silently skipped modules.
+    if [[ -s "$check_stderr" ]]; then
+        cat "$check_stderr" >&2
+    fi
+    rm -rf "$check_tmpdir" 2>/dev/null || true
 
     if [[ -z "$needs_update" ]]; then
         echo -e "${GREEN}✓${NC} All modules up to date"
@@ -270,7 +284,7 @@ cmd_update() {
         if ! _download_to_tmp "$kind" "$repo" "$path" "$ref" "$tmp_dest"; then ok=false; fi
 
         if ! $ok; then
-            rm -rf "$tmp_dest" 2>/dev/null
+            rm -rf "$tmp_dest" 2>/dev/null || true
             echo -e "  ${RED}✗${NC} ${name} download failed"
             errors=$((errors + 1))
             continue
@@ -279,11 +293,15 @@ cmd_update() {
         # Swap with backup
         [ -d "$dest" ] && mv "$dest" "${dest}.bak"
         if mv "$tmp_dest" "$dest" 2>/dev/null; then
-            rm -rf "${dest}.bak" 2>/dev/null
-        elif (mkdir -p "$dest" && cp -rf "$tmp_dest"/. "$dest"/ && rm -rf "$tmp_dest"); then
-            rm -rf "${dest}.bak" 2>/dev/null
+            rm -rf "${dest}.bak" 2>/dev/null || true
+        elif (mkdir -p "$dest" && cp -rf "$tmp_dest"/. "$dest"/); then
+            # Commit point: dest holds the new data. tmp_dest cleanup is best-effort —
+            # the EXIT trap will catch it if rm fails here, so don't roll back the
+            # successful copy just because the temp removal stumbled.
+            rm -rf "$tmp_dest" 2>/dev/null || true
+            rm -rf "${dest}.bak" 2>/dev/null || true
         else
-            rm -rf "$dest" 2>/dev/null
+            rm -rf "$dest" 2>/dev/null || true
             if [ -d "${dest}.bak" ]; then
                 if ! mv "${dest}.bak" "$dest"; then
                     echo -e "  ${RED}✗${NC} CRITICAL: backup restore failed for ${name}! Backup at ${dest}.bak" >&2
@@ -323,10 +341,13 @@ cmd_install() {
         esac
     done
 
-    [[ -z "$source_str" ]] && { echo "用法：module-manager.sh install <source> [--name <name>]"; exit 1; }
+    [[ -z "$source_str" ]] && { echo "用法：module-manager.sh install <source> [--name <name>]" >&2; exit 1; }
 
-    # Parse source
-    IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
+    # Parse source — propagate parse_source's failure (e.g. tab/newline rejection)
+    # so empty fields don't slip past as "URL kind requires --name" downstream.
+    local parsed
+    parsed=$(parse_source "$source_str") || exit 1
+    IFS=$'\t' read -r kind repo path ref <<< "$parsed"
 
     # Validate repo format
     if [[ ("$kind" == "github-subdir" || "$kind" == "github-repo") && -n "$repo" ]]; then
@@ -351,9 +372,11 @@ cmd_install() {
 
     local dest="${SKILLS_DIR}/${install_name}"
 
-    # Check for conflict
-    if [[ -d "$dest" ]]; then
-        echo -e "${RED}错误：目录已存在：$dest${NC}" >&2
+    # Check for conflict — match any existing entry, not just directories. A bare
+    # file at $dest would otherwise sneak past, fail mv, then trip set -e in the
+    # mkdir/cp fallback without ever emitting the CONFLICT_INSTALL marker.
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        echo -e "${RED}错误：路径已存在：$dest${NC}" >&2
         # Marker is the parsing contract with the SKILL.md install-conflict flow.
         # Changing the prefix is a breaking change — update both sides together.
         echo "CONFLICT_INSTALL: $dest" >&2
@@ -389,17 +412,23 @@ cmd_install() {
         download_github_repo "$repo" "${ref:-main}" "$tmp_dest" || dl_ok=false
     elif [[ "$kind" == "url" ]]; then
         echo -e "${RED}错误：URL 类型的来源尚未实现${NC}" >&2
-        rm -rf "$tmp_dest"
+        rm -rf "$tmp_dest" 2>/dev/null || true
         exit 1
     fi
     if ! $dl_ok; then
-        rm -rf "$tmp_dest"
+        rm -rf "$tmp_dest" 2>/dev/null || true
         exit 1
     fi
     if ! mv "$tmp_dest" "$dest" 2>/dev/null; then
-        mkdir -p "$dest"
-        cp -rf "$tmp_dest"/. "$dest"/
-        rm -rf "$tmp_dest"
+        # Cross-filesystem fallback: explicit error path so a partial cp doesn't leave
+        # half-written dest with no manifest entry and no clear signal to the user.
+        if ! (mkdir -p "$dest" && cp -rf "$tmp_dest"/. "$dest"/); then
+            echo -e "${RED}错误：写入 $dest 失败（mv 与 cp 均未成功）${NC}" >&2
+            rm -rf "$dest" 2>/dev/null || true
+            rm -rf "$tmp_dest" 2>/dev/null || true
+            exit 1
+        fi
+        rm -rf "$tmp_dest" 2>/dev/null || true
     fi
 
     # Add to manifest
@@ -416,7 +445,7 @@ cmd_install() {
 
 cmd_remove() {
     local name="${1:-}"
-    [[ -z "$name" ]] && { echo "用法：module-manager.sh remove <name>"; exit 1; }
+    [[ -z "$name" ]] && { echo "用法：module-manager.sh remove <name>" >&2; exit 1; }
 
     local data
     data=$(manifest_json)
@@ -431,6 +460,10 @@ cmd_remove() {
     local install_path
     install_path=$(echo "$data" | py_helper module-get-path "$name")
 
+    # Validate install_path from manifest before rm -rf — defends against a
+    # corrupted/poisoned modules.toml that pushes "../somewhere" into the path.
+    _validate_module_name "$install_path" || exit 1
+
     local dest="${SKILLS_DIR}/${install_path}"
 
     # Remove from manifest FIRST (so a save failure doesn't orphan the directory)
@@ -440,8 +473,12 @@ cmd_remove() {
 
     # Then remove directory
     if [[ -d "$dest" ]]; then
-        rm -rf "$dest"
-        echo -e "${GREEN}✓${NC} Removed directory: ${dest}"
+        if rm -rf "$dest" 2>/dev/null; then
+            echo -e "${GREEN}✓${NC} Removed directory: ${dest}"
+        else
+            echo -e "${RED}✗${NC} 删除目录失败：${dest}（manifest 已清除，目录残留）" >&2
+            exit 1
+        fi
     else
         echo -e "${YELLOW}⚠${NC} Directory not found: ${dest}"
     fi
@@ -452,7 +489,7 @@ cmd_adopt() {
     local arg2="${2:-}"
 
     if [[ "$arg1" == "--bulk" ]]; then
-        [[ -z "$arg2" ]] && { echo "用法：module-manager.sh adopt --bulk <owner/repo>"; exit 1; }
+        [[ -z "$arg2" ]] && { echo "用法：module-manager.sh adopt --bulk <owner/repo>" >&2; exit 1; }
         cmd_adopt_bulk "$arg2"
         return
     fi
@@ -460,7 +497,7 @@ cmd_adopt() {
     # Single adopt: adopt <name> <source>
     local name="$arg1"
     local source_str="$arg2"
-    [[ -z "$name" || -z "$source_str" ]] && { echo "用法：module-manager.sh adopt <name> <source>"; exit 1; }
+    [[ -z "$name" || -z "$source_str" ]] && { echo "用法：module-manager.sh adopt <name> <source>" >&2; exit 1; }
 
     _validate_module_name "$name" || exit 1
 
@@ -468,8 +505,11 @@ cmd_adopt() {
     local dest="${SKILLS_DIR}/${name}"
     [[ -d "$dest" ]] || { echo -e "${RED}错误：目录不存在：$dest${NC}" >&2; exit 1; }
 
-    # Parse source
-    IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
+    # Parse source — propagate parse_source's failure so we don't write a manifest
+    # entry with empty kind on tab/newline rejection.
+    local parsed
+    parsed=$(parse_source "$source_str") || exit 1
+    IFS=$'\t' read -r kind repo path ref <<< "$parsed"
 
     # Reject URL sources (not yet implemented for adopt)
     if [[ "$kind" == "url" ]]; then
@@ -618,12 +658,12 @@ cmd_restore() {
             if ! mv "$tmp_dest" "$dest" 2>/dev/null; then
                 mkdir -p "$dest"
                 cp -rf "$tmp_dest"/. "$dest"/
-                rm -rf "$tmp_dest"
+                rm -rf "$tmp_dest" 2>/dev/null || true
             fi
             echo -e "  ${GREEN}✓${NC} ${name}"
             restored=$((restored + 1))
         else
-            rm -rf "$tmp_dest" 2>/dev/null
+            rm -rf "$tmp_dest" 2>/dev/null || true
             echo -e "  ${RED}✗${NC} ${name}"
             failed=$((failed + 1))
         fi
@@ -640,6 +680,10 @@ cmd_prune() {
     case "${1:-}" in
         --all)
             mode="all"
+            if [[ $# -gt 1 ]]; then
+                echo "用法：module-manager.sh prune --all（不接受其他参数）" >&2
+                exit 1
+            fi
             ;;
         --confirm)
             mode="confirm"
@@ -684,9 +728,13 @@ cmd_prune() {
             fi
             local dest="${SKILLS_DIR}/${name}"
             if [[ -d "$dest" ]]; then
-                rm -rf "$dest"
-                echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
-                removed=$((removed + 1))
+                if rm -rf "$dest" 2>/dev/null; then
+                    echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
+                    removed=$((removed + 1))
+                else
+                    echo -e "  ${RED}✗${NC} ${name}: 删除失败"
+                    errors=$((errors + 1))
+                fi
             else
                 echo -e "  ${YELLOW}⚠${NC} ${name}: 目录已不存在，跳过"
             fi
@@ -715,9 +763,13 @@ cmd_prune() {
             echo -e "  ${YELLOW}⚠${NC} ${name}: 目录不存在 (${dest})，跳过"
             continue
         fi
-        rm -rf "$dest"
-        echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
-        removed=$((removed + 1))
+        if rm -rf "$dest" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} 已删除 ${name}/"
+            removed=$((removed + 1))
+        else
+            echo -e "  ${RED}✗${NC} ${name}: 删除失败"
+            errors=$((errors + 1))
+        fi
     done
     echo ""
     echo "已清理: $removed, 失败: $errors"
