@@ -1,11 +1,12 @@
 ---
 name: module-manager
-description: "Manages third-party Claude Code modules (skills, plugins, MCP servers) — install, update, remove, restore, and track via modules.toml. Triggers: managing modules, install/update/remove skill, list installed modules, sync skills across devices, new machine setup. Also: 模块管理, 安装/更新/删除/恢复技能, 检查更新, 纳管, 新设备恢复."
+description: "Manages third-party Claude Code modules (skills and MCP servers) — install, update, remove, restore, and track via modules.toml. Triggers: managing modules, install/update/remove skill, list installed modules, sync skills across devices, new machine setup. Also: 模块管理, 安装/更新/删除/恢复技能, 检查更新, 纳管, 新设备恢复."
 ---
 
 # Module Manager — Third-Party Module Management
 
-This skill installs, updates, removes, restores, and tracks externally-sourced modules (skills / plugins / MCP servers) under `~/.claude/skills/`, using `modules.toml` as the manifest.
+Manages all externally-sourced modules (skills / plugins / MCP servers) under `~/.claude/skills/`.
+Does not manage user-authored skills in project `.claude/skills/` directories.
 
 ## Not For
 
@@ -16,9 +17,43 @@ This skill installs, updates, removes, restores, and tracks externally-sourced m
 
 ## Critical Rules
 
+### Entry point: two-layer AskUserQuestion menu
+
+When user invokes /module-manager without specifying an operation, present a two-layer menu:
+
+1. First, ask the user to pick a category using AskUserQuestion:
+
+```json
+{"questions": [{"header": "module-mgr", "question": "模块管理——要做什么？", "multiSelect": false, "options": [{"label": "查看与更新", "description": "查看已安装模块状态、检查更新、拉取最新版本"}, {"label": "新设备恢复", "description": "按 manifest 重新安装全部模块（新设备/重装后使用）"}, {"label": "安装与管理", "description": "安装新模块、删除已有模块、将现有目录纳入管理"}]}]}
+```
+
+2. Based on their choice, either ask a second question or execute directly:
+
+**"查看与更新"** → ask second AskUserQuestion:
+```json
+{"questions": [{"header": "view-update", "question": "选择具体操作：", "multiSelect": false, "options": [{"label": "list", "description": "查看已安装模块列表和未管理目录"}, {"label": "check", "description": "检查所有模块是否有可用更新"}, {"label": "update", "description": "拉取并安装所有可用更新"}]}]}
+```
+
+**"新设备恢复"** → confirm before executing, because `restore` downloads every module in the manifest and writes under `~/.claude/skills/`:
+
+```json
+{"questions": [{"header": "restore-confirm", "question": "即将从 manifest 恢复全部模块到 ~/.claude/skills/，继续吗？", "multiSelect": false, "options": [{"label": "确认恢复", "description": "按 modules.toml 下载并安装所有模块"}, {"label": "先列出", "description": "先运行 list 看看当前状态再决定"}, {"label": "取消", "description": "不执行 restore"}]}]}
+```
+
+After confirmation, run `bash module-manager.sh restore`.
+
+**"安装与管理"** → ask second AskUserQuestion:
+```json
+{"questions": [{"header": "manage", "question": "选择具体操作：", "multiSelect": false, "options": [{"label": "install", "description": "从 GitHub 安装新模块（需要提供 source）"}, {"label": "remove", "description": "删除已安装模块（目录 + manifest 记录）"}, {"label": "adopt", "description": "将已有目录纳入 manifest 管理（补登记）"}]}]}
+```
+
+3. Execute the selected operation per the Workflow section below.
+
+**Skip the menu** if the user already specified what they want (e.g., "帮我更新所有模块", "list", "install xxx"). In that case, execute directly.
+
 ### Always confirm source format before install
 
-A vague request like "install the pdf skill" does not identify a unique `owner/repo:path` source — guessing risks installing the wrong module.
+When user says something vague like "install the pdf skill", ask for the exact `owner/repo:path` source before running the script.
 
 **WRONG**:
 - Running `bash module-manager.sh install anthropics/skills:skills/pdf` based on a guess
@@ -28,8 +63,6 @@ A vague request like "install the pdf skill" does not identify a unique `owner/r
 **RIGHT**: Confirm the exact source with the user before calling the script.
 
 ### Show all script output verbatim
-
-Script output is the source of truth for which modules changed and why; reformatting it can drop details the user needs.
 
 **WRONG**:
 - Reformatting the `list` table into markdown
@@ -48,15 +81,15 @@ After any install, update, remove, or adopt operation that modifies `modules.tom
 When `restore` output shows some modules failed to download:
 
 ```json
-{"questions": [{"header": "restore-fail", "question": "Some modules failed to restore. How to proceed?", "multiSelect": false, "options": [{"label": "Retry failed", "description": "Re-run restore (already-installed modules are skipped)"}, {"label": "Show errors", "description": "Display full error output for diagnosis"}, {"label": "Skip for now", "description": "Continue without these modules, fix later"}]}]}
+{"questions": [{"header": "restore-fail", "question": "部分模块恢复失败，如何处理？", "multiSelect": false, "options": [{"label": "重试失败项", "description": "重新运行 restore（已安装模块会跳过）"}, {"label": "查看错误", "description": "显示完整错误输出以便诊断"}, {"label": "暂时跳过", "description": "先继续，稍后再处理"}]}]}
 ```
 
 #### Remove confirmation
 
-Before executing `remove`:
+Before executing `remove`. Substitute `<name>` with the actual module name in both `question` and the first option's `description` before calling AskUserQuestion:
 
 ```json
-{"questions": [{"header": "remove", "question": "Remove module '<name>'? This deletes the directory and manifest entry.", "multiSelect": false, "options": [{"label": "Yes, remove", "description": "Delete ~/.claude/skills/<name> and remove from modules.toml"}, {"label": "Cancel", "description": "Keep the module installed"}]}]}
+{"questions": [{"header": "remove", "question": "删除模块 '<name>'？会同时删除目录和 manifest 记录。", "multiSelect": false, "options": [{"label": "确认删除", "description": "删除 ~/.claude/skills/<name> 并从 modules.toml 移除"}, {"label": "取消", "description": "保留该模块"}]}]}
 ```
 
 #### Untracked directory adoption
@@ -69,7 +102,7 @@ When `list` shows untracked directories:
 
 ## Core Concepts
 
-- **Manifest** (`~/.claude/skills/modules.toml`): Records each module’s source, version, install time
+- **Manifest** (`~/.claude/skills/modules.toml`): Records each module's source, version, install time
 - **Script** (`module-manager.sh`): Handles all mechanical operations
 - **Cross-device sync**: Manifest syncs via dotfiles; new devices use `restore` to reinstall
 
@@ -127,7 +160,7 @@ bash module-manager.sh install <source> [--name <name>]
 | `owner/repo` | Entire GitHub repo | `someuser/my-cool-skill` |
 | `https://...` | Direct download URL | `https://example.com/skill.zip` |
 
-When user description is imprecise (e.g., "install the pdf skill"), do NOT guess the source format. Confirm the full owner/repo and path with the user before calling the script.
+When user description is imprecise (e.g., "install the pdf skill"), confirm the full `owner/repo` and path before calling the script. See Critical Rules § source format.
 
 ### Remove Module: `remove`
 
@@ -159,9 +192,9 @@ bash module-manager.sh adopt --bulk anthropics/skills
 bash module-manager.sh restore
 ```
 
-Downloads and installs all modules from manifest. Used for new device setup.
+Downloads and installs all modules from manifest. Used for new device setup. **Must confirm with user before executing** — see the `restore-confirm` template under Critical Rules.
 
-If some modules fail (network issues), show the script’s error output verbatim. List possible causes (proxy config, API rate limit, repo not found) for user to judge — do not diagnose on their behalf.
+If some modules fail (network issues), show the script's error output verbatim. List possible causes (proxy config, API rate limit, repo not found) for user to judge — do not diagnose on their behalf.
 
 ## Error Handling
 
@@ -173,13 +206,10 @@ If some modules fail (network issues), show the script’s error output verbatim
 
 **Manifest corrupted:** Suggest restoring from dotfiles repo, or rebuilding via `adopt --bulk`.
 
-## Notes
+## Gotchas
 
-- Show all output verbatim — do not reformat, wrap in code blocks, or build tables
-- Confirm before install or remove operations
-- After manifest changes, remind user to run /sync to propagate to other devices
-- Script path is `module-manager.sh` relative to project root — execute as-is, do not rewrite paths
-- Managed modules must NOT be stored as file copies in dotfiles/skills/. Only modules.toml (the manifest) is synced via dotfiles; actual module files are installed by `restore` on each device.
+- **Script path is relative**: `module-manager.sh` is at project root — execute as-is, do not rewrite to absolute paths
+- **Manifest is the source of truth**: managed modules must NOT be stored as file copies in dotfiles/skills/. Only `modules.toml` syncs via dotfiles; actual module files are installed by `restore` on each device
 
 ## Experience Log
 

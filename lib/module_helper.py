@@ -25,11 +25,32 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 DEFAULT_REF = "main"
 MODULE_TYPE = "skill"
+_REPO_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def _validate_repo(repo):
+    """Reject repo strings that could manipulate the gh api URL (e.g. '../x/y')."""
+    if not _REPO_RE.match(repo):
+        raise ValueError(f"无效的仓库格式：{repo!r}")
+    owner, name = repo.split("/", 1)
+    if owner in (".", "..") or name in (".", ".."):
+        raise ValueError(f"仓库名不能为 . 或 ..：{repo!r}")
+
+
+def _read_json_stdin():
+    """Read+parse JSON from stdin with a clean Chinese error on corruption."""
+    try:
+        return json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"错误：stdin JSON 解析失败 ({e})", file=sys.stderr)
+        sys.exit(1)
 
 
 def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
     """Download file via gh api (authenticated) with timeout and size limit.
-    Falls back to urllib if gh is unavailable."""
+    Falls back to urllib if gh is unavailable. Both paths stream with a
+    running byte count so an oversized response is aborted mid-read, not
+    after fully buffering into memory."""
     # Try gh api first (authenticated, handles private repos)
     gh_cmd = os.environ.get("GH_CMD", "gh")
     # Extract owner/repo/ref/path from raw.githubusercontent.com URL
@@ -37,21 +58,46 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)", url)
     if m:
         repo = f"{m.group(1)}/{m.group(2)}"
-        ref, path = m.group(3), m.group(4)
-        api_url = f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}"
         try:
-            result = subprocess.run(
-                [gh_cmd, "api", api_url, "--header", "Accept: application/vnd.github.raw+json"],
-                capture_output=True, timeout=timeout,
-            )
-            if result.returncode == 0 and len(result.stdout) > 0:
-                if len(result.stdout) > max_bytes:
-                    raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
-                with open(out, "wb") as f:
-                    f.write(result.stdout)
-                return
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # gh not available or timed out, fall back to urllib
+            _validate_repo(repo)
+        except ValueError:
+            pass  # fall through to urllib fallback (SSRF guard catches it)
+        else:
+            ref, path = m.group(3), m.group(4)
+            api_url = f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}"
+            try:
+                # stderr=DEVNULL: we don't consume it, so piping it would risk blocking
+                # gh once the pipe buffer fills (64 KB typical). Falls through to urllib
+                # on nonzero exit anyway, so stderr content isn't actionable here.
+                proc = subprocess.Popen(
+                    [gh_cmd, "api", api_url, "--header", "Accept: application/vnd.github.raw+json"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    total = 0
+                    with open(out, "wb") as f:
+                        while True:
+                            chunk = proc.stdout.read(8192)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > max_bytes:
+                                proc.kill()
+                                raise ValueError(f"Download exceeds {max_bytes // (1024*1024)}MB limit")
+                            f.write(chunk)
+                    try:
+                        proc.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        raise
+                    if proc.returncode == 0 and total > 0:
+                        return
+                    # gh failed; fall through to urllib
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+            except FileNotFoundError:
+                pass  # gh not installed, fall back to urllib
 
     # Fallback: direct urllib download (unauthenticated)
     # Only allow HTTPS from trusted GitHub domains (prevent SSRF via crafted API responses)
@@ -77,14 +123,25 @@ def _safe_download(url, out, timeout=30, max_bytes=10 * 1024 * 1024):
 # ── TOML helpers ────────────────────────────────────────────────────
 
 def _toml_escape(s):
-    """Escape a string for TOML double-quoted values (incl. control chars)."""
+    """Escape a string for TOML double-quoted values.
+    Handles \\ " and all ASCII control chars (TOML 1.0 forbids raw \\x00-\\x1f)."""
     s = str(s)
     s = s.replace("\\", "\\\\")
     s = s.replace('"', '\\"')
-    s = s.replace("\n", "\\n")
-    s = s.replace("\r", "\\r")
-    s = s.replace("\t", "\\t")
-    return s
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 # ── Shared: fetch latest SHAs from GitHub ───────────────────────────
@@ -122,6 +179,14 @@ def _fetch_latest_shas(modules, target, gh):
 
     for (repo, ref, path), mods in repos.items():
         try:
+            # Re-validate repo at use-site — modules.toml is user-controlled but could
+            # also be corrupted, and '../x/y' in repo would retarget the gh api URL.
+            try:
+                _validate_repo(repo)
+            except ValueError as ve:
+                for name, _ in mods:
+                    errors.append((name, str(ve)))
+                continue
             if path:
                 # Path-specific query: latest commit touching this subdirectory
                 cmd = [gh, "api",
@@ -173,14 +238,14 @@ def cmd_manifest_read():
     except FileNotFoundError:
         json.dump({"version": 1, "modules": {}}, sys.stdout)
     except Exception as e:
-        print(str(e), file=sys.stderr)
+        print(f"错误：读取 manifest 失败 ({e})", file=sys.stderr)
         sys.exit(1)
 
 
 def cmd_manifest_write():
     """Read JSON from stdin -> write TOML to file."""
     manifest = sys.argv[2]
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     lines = [
         "# Module Manager manifest — auto-generated",
         f'version = {data.get("version", 1)}',
@@ -233,23 +298,30 @@ def cmd_tab_vars():
     """Output module fields as tab-separated values in fixed order.
     Reads JSON from stdin (piped from bash via: echo "$json" | py_helper tab-vars).
     Fields: name, kind, repo, path, ref, install_path, latest_sha"""
-    obj = json.loads(sys.stdin.readline())
+    try:
+        obj = json.loads(sys.stdin.readline())
+    except json.JSONDecodeError as e:
+        print(f"错误：tab-vars 输入 JSON 解析失败 ({e})", file=sys.stderr)
+        sys.exit(1)
     fields = ["name", "kind", "repo", "path", "ref", "install_path", "latest_sha"]
     print("\t".join(str(obj.get(f, "")) for f in fields))
 
 
 def cmd_module_exists():
     """Check whether a module name exists in manifest JSON (stdin). Prints 'yes'/'no'."""
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     name = sys.argv[2]
     print("yes" if name in data.get("modules", {}) else "no")
 
 
 def cmd_manifest_add_module():
     """Add/overwrite a module entry. Reads JSON from stdin, prints updated JSON."""
+    if len(sys.argv) < 9:
+        print("错误：manifest-add-module 参数不足（需要 name sha today kind repo path ref）", file=sys.stderr)
+        sys.exit(1)
     name, sha, today = sys.argv[2], sys.argv[3], sys.argv[4]
     kind, repo, path, ref = sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     source = {"kind": kind, "ref": ref}
     if repo:
         source["repo"] = repo
@@ -284,7 +356,7 @@ def cmd_download_github_subdir():
             timeout=30,
         )
         if result.returncode != 0:
-            print(f"  API error for {path}: {result.stderr.strip()}", file=sys.stderr)
+            print(f"  {path} 的 API 调用失败：{result.stderr.strip()}", file=sys.stderr)
             return False
 
         items = json.loads(result.stdout)
@@ -300,7 +372,7 @@ def cmd_download_github_subdir():
             raw_name = item.get("name") if isinstance(item, dict) else None
             item_type = item.get("type") if isinstance(item, dict) else None
             if not raw_name or not item_type:
-                print(f"  Skipped (malformed item, missing name/type): {item!r}", file=sys.stderr)
+                print(f"  跳过（条目残缺，缺少 name/type）：{item!r}", file=sys.stderr)
                 continue
             # Sanitize filename to prevent path traversal from API responses.
             # os.path.basename is cross-platform: on POSIX it strips up to last "/",
@@ -312,7 +384,7 @@ def cmd_download_github_subdir():
                 continue
             target = os.path.realpath(os.path.join(dest, name))
             if not target.startswith(resolved_dest + os.sep):
-                print(f"  Skipped (path traversal): {raw_name}", file=sys.stderr)
+                print(f"  跳过（检测到路径穿越）：{raw_name}", file=sys.stderr)
                 continue
             if item_type == "dir":
                 if not download_dir(repo, item.get("path", ""), ref, os.path.join(dest, name)):
@@ -325,7 +397,7 @@ def cmd_download_github_subdir():
                 try:
                     _safe_download(url, out)
                 except Exception as e:
-                    print(f"  Failed: {name} ({e})", file=sys.stderr)
+                    print(f"  下载失败：{name} ({e})", file=sys.stderr)
                     ok = False
         return ok
 
@@ -403,7 +475,7 @@ def cmd_check():
 
     if updates is None:
         # target not found
-        print(f'Module "{target}" not found in manifest.')
+        print(f'manifest 中未找到模块 "{target}"。')
         sys.exit(1)
 
     if updates:
@@ -472,9 +544,9 @@ def cmd_update_check():
 def cmd_manifest_update_sha():
     """Update commit_sha and last_updated for a module. JSON stdin -> JSON stdout."""
     name, sha, today = sys.argv[2], sys.argv[3], sys.argv[4]
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     if name not in data.get("modules", {}):
-        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        print(f"错误：manifest 中未找到模块 '{name}'", file=sys.stderr)
         sys.exit(1)
     data["modules"][name]["commit_sha"] = sha
     data["modules"][name]["last_updated"] = today
@@ -483,20 +555,20 @@ def cmd_manifest_update_sha():
 
 def cmd_module_get_path():
     """Print install_path for a module. JSON stdin."""
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     name = sys.argv[2]
     if name not in data.get("modules", {}):
-        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        print(f"错误：manifest 中未找到模块 '{name}'", file=sys.stderr)
         sys.exit(1)
     print(data["modules"][name].get("install_path", name))
 
 
 def cmd_manifest_delete_module():
     """Delete a module from manifest JSON. stdin -> stdout."""
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     name = sys.argv[2]
     if name not in data.get("modules", {}):
-        print(f"Error: module '{name}' not in manifest", file=sys.stderr)
+        print(f"错误：manifest 中未找到模块 '{name}'", file=sys.stderr)
         sys.exit(1)
     del data["modules"][name]
     json.dump(data, sys.stdout, ensure_ascii=False)
@@ -504,13 +576,13 @@ def cmd_manifest_delete_module():
 
 def cmd_restore_count():
     """Print total number of modules in manifest. JSON stdin."""
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     print(len(data.get("modules", {})))
 
 
 def cmd_restore_list_missing():
     """List modules missing locally. One JSON line per missing module. JSON stdin."""
-    data = json.load(sys.stdin)
+    data = _read_json_stdin()
     skills_dir = sys.argv[2]
 
     for name, mod in data.get("modules", {}).items():

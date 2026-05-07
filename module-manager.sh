@@ -23,7 +23,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 # so Python (native Windows) can resolve them correctly.
 SKILLS_DIR=$(normalize_path "${HOME}/.claude/skills")
 MANIFEST="${SKILLS_DIR}/modules.toml"
-TODAY=$(date +%Y-%m-%d)
+TODAY=$(date -u +%Y-%m-%d)  # UTC — avoids cross-timezone diff noise in synced modules.toml
 
 detect_gh || exit 1
 MODULE_HELPER=$(normalize_path "$SCRIPT_DIR/lib/module_helper.py")
@@ -40,8 +40,15 @@ trap _cleanup_temps EXIT INT TERM
 
 # --- 仓库格式验证 ---
 _validate_repo_format() {
-    if [[ ! "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    # owner/repo — alphanumeric + _ . - ; reject . / .. / leading-dash in either component
+    # (GitHub rejects these with 404; also closes defense-in-depth gaps)
+    if [[ ! "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
         echo -e "${RED}错误：无效的仓库格式 '$1'（应为 owner/repo）${NC}" >&2
+        return 1
+    fi
+    local owner="${1%%/*}" name="${1##*/}"
+    if [[ "$owner" == "." || "$owner" == ".." || "$name" == "." || "$name" == ".." ]]; then
+        echo -e "${RED}错误：仓库名不能为 . 或 ..（收到 '$1'）${NC}" >&2
         return 1
     fi
 }
@@ -80,13 +87,49 @@ manifest_add_module() {
     echo "$1" | py_helper manifest-add-module "$2" "$3" "$4" "$5" "$6" "$7" "$8"
 }
 
+# ─── Validation helpers ───────────────────────────────────────────
+
+# Validate module name: alphanumeric, hyphens, underscores, dots only.
+# Rejects path traversal (../), slashes, and shell metacharacters.
+_validate_module_name() {
+    local name="$1"
+    if [[ "$name" == "." || "$name" == ".." ]]; then
+        echo -e "${RED}错误：无效的模块名 '$name'${NC}" >&2
+        return 1
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo -e "${RED}错误：模块名 '$name' 只能包含 A-Z a-z 0-9 _ - . ${NC}" >&2
+        return 1
+    fi
+}
+
 # ─── GitHub helpers ───────────────────────────────────────────────
+
+# URL-encode a string via Python's urllib.parse.quote (matches helper's Python side).
+# Bash has no builtin quoting; we shell out to python for correctness.
+_url_encode() {
+    python -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
 
 get_head_sha() {
     local repo="$1" ref="${2:-main}"
-    local sha
-    sha=$("$GH" api "repos/${repo}/commits/${ref}" -q '.sha' 2>/dev/null) || return 1
+    local sha enc_ref
+    enc_ref=$(_url_encode "$ref")
+    sha=$("$GH" api "repos/${repo}/commits/${enc_ref}" -q '.sha' 2>/dev/null) || return 1
     # Validate: must be 40-char hex (reject null, empty, error messages)
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    echo "$sha"
+}
+
+# Get the latest commit SHA that touched a specific subdirectory.
+# Uses the commits list API with path filter (equivalent to git log -1 -- path).
+get_path_sha() {
+    local repo="$1" path="$2" ref="${3:-main}"
+    local sha enc_ref enc_path
+    enc_ref=$(_url_encode "$ref")
+    # path: keep forward slashes (they are path separators, not delimiters)
+    enc_path=$(python -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe='/'))" "$path")
+    sha=$("$GH" api "repos/${repo}/commits?sha=${enc_ref}&path=${enc_path}&per_page=1" -q '.[0].sha' 2>/dev/null) || return 1
     [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
     echo "$sha"
 }
@@ -108,15 +151,22 @@ download_github_repo() {
 
     if ! git clone --depth 1 --branch "$ref" --single-branch \
          "https://github.com/${repo}.git" "$tmp_clone" 2>/dev/null; then
-        echo "${RED}✗ Failed to clone branch '$ref' from https://github.com/${repo}.git${NC}" >&2
+        echo -e "${RED}✗ Failed to clone branch '$ref' from https://github.com/${repo}.git${NC}" >&2
         rm -rf "$tmp_clone"
         return 1
     fi
 
     mkdir -p "$dest"
-    # Copy contents, exclude .git
-    (cd "$tmp_clone" && find . -maxdepth 1 ! -name . ! -name .git -exec cp -rf {} "$dest"/ \;)
+    # Copy contents. -maxdepth 1 ! -type l excludes top-level symlinks; cp -a preserves
+    # and does NOT dereference nested symlinks (plain cp -r follows them on some platforms,
+    # which would let a malicious upstream repo exfiltrate files outside $dest).
+    # Any symlinks that survived are then hard-deleted from $dest for defense-in-depth.
+    local copy_errors=0
+    (set -o pipefail; cd "$tmp_clone" && find . -maxdepth 1 ! -name . ! -name .git ! -type l -print0 \
+        | xargs -0 -I '{}' cp -a '{}' "$dest"/) || copy_errors=1
+    find "$dest" -type l -delete 2>/dev/null || true
     rm -rf "$tmp_clone"
+    return $copy_errors
 }
 
 _download_to_tmp() {
@@ -201,6 +251,13 @@ cmd_update() {
         local name kind repo path ref install_path latest_sha
         IFS=$'\t' read -r name kind repo path ref install_path latest_sha <<< "$(echo "$line" | py_helper tab-vars)"
 
+        # Validate install_path from manifest (prevent path traversal)
+        if ! _validate_module_name "$install_path" 2>/dev/null; then
+            echo -e "  ${RED}✗${NC} ${name}: invalid install_path '${install_path}', skipping"
+            errors=$((errors + 1))
+            continue
+        fi
+
         echo -e "→ Updating ${name}..."
         local dest="${SKILLS_DIR}/${install_path}"
 
@@ -226,7 +283,11 @@ cmd_update() {
             rm -rf "${dest}.bak" 2>/dev/null
         else
             rm -rf "$dest" 2>/dev/null
-            [ -d "${dest}.bak" ] && mv "${dest}.bak" "$dest"
+            if [ -d "${dest}.bak" ]; then
+                if ! mv "${dest}.bak" "$dest"; then
+                    echo -e "  ${RED}✗${NC} CRITICAL: backup restore failed for ${name}! Backup at ${dest}.bak" >&2
+                fi
+            fi
             ok=false
         fi
 
@@ -241,8 +302,10 @@ cmd_update() {
         fi
     done <<< "$needs_update"
 
-    # Save updated manifest
-    echo "$data" | save_manifest
+    # Save updated manifest only if at least one module was updated
+    if [[ $count -gt 0 ]]; then
+        echo "$data" | save_manifest
+    fi
 
     echo ""
     echo "Updated: $count, Failed: $errors"
@@ -259,7 +322,7 @@ cmd_install() {
         esac
     done
 
-    [[ -z "$source_str" ]] && { echo "Usage: module-manager.sh install <source> [--name <name>]"; exit 1; }
+    [[ -z "$source_str" ]] && { echo "用法：module-manager.sh install <source> [--name <name>]"; exit 1; }
 
     # Parse source
     IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
@@ -278,26 +341,36 @@ cmd_install() {
     elif [[ "$kind" == "github-repo" ]]; then
         install_name=$(basename "$repo")
     else
-        echo "Error: --name is required for URL sources" >&2
+        echo -e "${RED}错误：URL 类型的来源必须指定 --name${NC}" >&2
         exit 1
     fi
+
+    # Validate module name (prevent path traversal / shell metacharacters)
+    _validate_module_name "$install_name" || exit 1
 
     local dest="${SKILLS_DIR}/${install_name}"
 
     # Check for conflict
     if [[ -d "$dest" ]]; then
-        echo "Error: Directory already exists: $dest" >&2
+        echo -e "${RED}错误：目录已存在：$dest${NC}" >&2
         exit 2
     fi
 
-    # Get commit SHA
+    # Get commit SHA (path-specific for subdir modules, repo-level otherwise)
     local sha=""
     if [[ "$kind" != "url" && -n "$repo" ]]; then
         echo -e "→ Getting version info..."
-        sha=$(get_head_sha "$repo" "${ref:-main}") || {
-            echo "Error: Cannot reach $repo" >&2
-            exit 1
-        }
+        if [[ "$kind" == "github-subdir" && -n "$path" ]]; then
+            sha=$(get_path_sha "$repo" "$path" "${ref:-main}") || {
+                echo -e "${RED}错误：无法访问 $repo（路径：$path）${NC}" >&2
+                exit 1
+            }
+        else
+            sha=$(get_head_sha "$repo" "${ref:-main}") || {
+                echo -e "${RED}错误：无法访问 $repo${NC}" >&2
+                exit 1
+            }
+        fi
     fi
 
     # Download to temp, then move into place
@@ -311,7 +384,7 @@ cmd_install() {
     elif [[ "$kind" == "github-repo" ]]; then
         download_github_repo "$repo" "${ref:-main}" "$tmp_dest" || dl_ok=false
     elif [[ "$kind" == "url" ]]; then
-        echo "Error: URL source not yet implemented" >&2
+        echo -e "${RED}错误：URL 类型的来源尚未实现${NC}" >&2
         rm -rf "$tmp_dest"
         exit 1
     fi
@@ -339,14 +412,14 @@ cmd_install() {
 
 cmd_remove() {
     local name="${1:-}"
-    [[ -z "$name" ]] && { echo "Usage: module-manager.sh remove <name>"; exit 1; }
+    [[ -z "$name" ]] && { echo "用法：module-manager.sh remove <name>"; exit 1; }
 
     local data
     data=$(manifest_json)
 
     # Check if module exists in manifest
     if [[ "$(module_exists "$data" "$name")" != "yes" ]]; then
-        echo "Error: Module '$name' not found in manifest" >&2
+        echo -e "${RED}错误：manifest 中未找到模块 '$name'${NC}" >&2
         exit 1
     fi
 
@@ -356,19 +429,18 @@ cmd_remove() {
 
     local dest="${SKILLS_DIR}/${install_path}"
 
-    # Remove directory
+    # Remove from manifest FIRST (so a save failure doesn't orphan the directory)
+    data=$(echo "$data" | py_helper manifest-delete-module "$name")
+    echo "$data" | save_manifest
+    echo -e "${GREEN}✓${NC} Removed ${name} from manifest"
+
+    # Then remove directory
     if [[ -d "$dest" ]]; then
         rm -rf "$dest"
         echo -e "${GREEN}✓${NC} Removed directory: ${dest}"
     else
-        echo -e "${YELLOW}⚠${NC} Directory not found: ${dest} (removing manifest entry only)"
+        echo -e "${YELLOW}⚠${NC} Directory not found: ${dest}"
     fi
-
-    # Remove from manifest
-    data=$(echo "$data" | py_helper manifest-delete-module "$name")
-    echo "$data" | save_manifest
-
-    echo -e "${GREEN}✓${NC} Removed ${name} from manifest"
 }
 
 cmd_adopt() {
@@ -376,7 +448,7 @@ cmd_adopt() {
     local arg2="${2:-}"
 
     if [[ "$arg1" == "--bulk" ]]; then
-        [[ -z "$arg2" ]] && { echo "Usage: module-manager.sh adopt --bulk <owner/repo>"; exit 1; }
+        [[ -z "$arg2" ]] && { echo "用法：module-manager.sh adopt --bulk <owner/repo>"; exit 1; }
         cmd_adopt_bulk "$arg2"
         return
     fi
@@ -384,26 +456,40 @@ cmd_adopt() {
     # Single adopt: adopt <name> <source>
     local name="$arg1"
     local source_str="$arg2"
-    [[ -z "$name" || -z "$source_str" ]] && { echo "Usage: module-manager.sh adopt <name> <source>"; exit 1; }
+    [[ -z "$name" || -z "$source_str" ]] && { echo "用法：module-manager.sh adopt <name> <source>"; exit 1; }
+
+    _validate_module_name "$name" || exit 1
 
     # Verify directory exists
     local dest="${SKILLS_DIR}/${name}"
-    [[ -d "$dest" ]] || { echo "Error: Directory not found: $dest" >&2; exit 1; }
+    [[ -d "$dest" ]] || { echo -e "${RED}错误：目录不存在：$dest${NC}" >&2; exit 1; }
 
     # Parse source
     IFS=$'\t' read -r kind repo path ref <<< "$(parse_source "$source_str")"
+
+    # Reject URL sources (not yet implemented for adopt)
+    if [[ "$kind" == "url" ]]; then
+        echo -e "${RED}错误：adopt 不支持 URL 来源，请使用 owner/repo 或 owner/repo:path 格式。${NC}" >&2
+        exit 1
+    fi
 
     # Validate repo format
     if [[ ("$kind" == "github-subdir" || "$kind" == "github-repo") && -n "$repo" ]]; then
         _validate_repo_format "$repo" || exit 1
     fi
 
-    # Get current commit SHA
+    # Get current commit SHA (path-specific for subdir modules)
     local sha=""
     if [[ -n "$repo" ]]; then
-        sha=$(get_head_sha "$repo" "${ref:-main}") || {
-            echo -e "${YELLOW}⚠${NC} Cannot reach $repo, using empty SHA"
-        }
+        if [[ "$kind" == "github-subdir" && -n "$path" ]]; then
+            sha=$(get_path_sha "$repo" "$path" "${ref:-main}") || {
+                echo -e "${YELLOW}⚠${NC} Cannot reach $repo (path: $path), using empty SHA"
+            }
+        else
+            sha=$(get_head_sha "$repo" "${ref:-main}") || {
+                echo -e "${YELLOW}⚠${NC} Cannot reach $repo, using empty SHA"
+            }
+        fi
     fi
 
     # Add to manifest
@@ -423,14 +509,7 @@ cmd_adopt_bulk() {
     # Get the list of skill directories in the remote repo
     local remote_skills
     remote_skills=$("$GH" api "repos/${repo}/contents/skills" -q 'if type == "array" then .[].name else .name end' 2>/dev/null) || {
-        echo "Error: Cannot list skills in $repo" >&2
-        exit 1
-    }
-
-    # Get HEAD SHA
-    local sha
-    sha=$(get_head_sha "$repo" "main") || {
-        echo "Error: Cannot get HEAD for $repo" >&2
+        echo -e "${RED}错误：无法列出 $repo 中的 skills${NC}" >&2
         exit 1
     }
 
@@ -442,6 +521,13 @@ cmd_adopt_bulk() {
 
     while IFS= read -r skill_name; do
         [[ -z "$skill_name" ]] && continue
+
+        # Validate remote skill name (prevent path traversal from API responses)
+        if ! _validate_module_name "$skill_name" 2>/dev/null; then
+            echo -e "  ${YELLOW}⚠${NC} Skipped invalid name: ${skill_name}"
+            continue
+        fi
+
         local local_dir="${SKILLS_DIR}/${skill_name}"
 
         # Skip if not present locally
@@ -456,6 +542,12 @@ cmd_adopt_bulk() {
             continue
         fi
 
+        # Get path-specific SHA for each skill
+        local sha=""
+        sha=$(get_path_sha "$repo" "skills/${skill_name}" "main") || {
+            echo -e "  ${YELLOW}⚠${NC} Cannot get SHA for skills/${skill_name}, using empty"
+        }
+
         # Add to manifest
         data=$(manifest_add_module "$data" "$skill_name" "$sha" "$TODAY" \
             "github-subdir" "$repo" "skills/${skill_name}" "main")
@@ -463,8 +555,10 @@ cmd_adopt_bulk() {
         adopted=$((adopted + 1))
     done <<< "$remote_skills"
 
-    # Save
-    echo "$data" | save_manifest
+    # Save only if at least one module was adopted
+    if [[ $adopted -gt 0 ]]; then
+        echo "$data" | save_manifest
+    fi
 
     echo ""
     echo "Adopted: $adopted, Skipped: $skipped"
@@ -475,7 +569,7 @@ cmd_restore() {
     local data
     data=$(manifest_json)
 
-    local total missing
+    local total
     total=$(echo "$data" | py_helper restore-count)
 
     if [[ "$total" == "0" ]]; then
@@ -500,6 +594,13 @@ cmd_restore() {
         [[ -z "$line" ]] && continue
         local name kind repo path ref install_path latest_sha
         IFS=$'\t' read -r name kind repo path ref install_path latest_sha <<< "$(echo "$line" | py_helper tab-vars)"
+
+        # Validate install_path from manifest (prevent path traversal)
+        if ! _validate_module_name "$install_path" 2>/dev/null; then
+            echo -e "  ${RED}✗${NC} ${name}: invalid install_path '${install_path}', skipping"
+            failed=$((failed + 1))
+            continue
+        fi
 
         local dest="${SKILLS_DIR}/${install_path}"
         echo -e "→ Restoring ${name}..."
