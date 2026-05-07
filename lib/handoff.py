@@ -19,9 +19,93 @@ def _ensure_utf8():
 _ensure_utf8()
 
 
+# Unicode line-terminator chars beyond \n / \r that Python regex `^` / `$` in
+# MULTILINE mode also recognize. A device name containing any of these would
+# slip past a naive \n / \r-only guard and corrupt section-boundary parsing.
+_LINE_TERMINATORS = re.compile(r"[\n\r\x0b\x0c\x1c-\x1e\x85  ]")
+
+
+def _validate_section_name(name):
+    """Reject device names that break section parsing or registry round-trip."""
+    if not name:
+        # `## ` (empty header) writes a degenerate boundary; an empty registry entry
+        # also produces an alternation `(?:...|)` whose empty branch matches every `## `
+        # prefix as zero-width, breaking section termination.
+        raise ValueError("设备名不能为空")
+    if _LINE_TERMINATORS.search(name):
+        raise ValueError("设备名不能包含换行类字符（\\n / \\r / U+2028 等）")
+    if "-->" in name or "<!--" in name:
+        raise ValueError("设备名不能包含 '<!--' 或 '-->'（会破坏 registry 注释）")
+    if "," in name:
+        # ',' is the registry list separator; embedding it splits the name on round-trip
+        # and the resulting fragments wouldn't match the actual `## Name,...` header.
+        raise ValueError("设备名不能包含 ','（registry 用逗号分隔，会破坏解析）")
+    if name != name.strip():
+        # Leading/trailing whitespace would silently survive in the registry list
+        # (after split-and-strip) but mismatch the on-disk `## <name>` line, breaking
+        # downstream lookups that compare normalized name vs raw header text.
+        raise ValueError("设备名不能以空格开头或结尾")
+
+
+def _iter_top_level_lines(lines):
+    """Yield (index, line) for each line OUTSIDE fenced code blocks.
+
+    Tracks fence opener char AND length so a 3-backtick line cannot prematurely
+    close a 4+-backtick fence (CommonMark §4.5). 4+ space-indented backtick lines
+    are NOT fences (CommonMark §4.4) — handled in `_fence_marker`. A line with an
+    info string (`"```python"`) is a valid opener but NOT a valid closer — also
+    handled by `_fence_marker` returning has_info_string=True.
+
+    Fence-marker lines themselves are never yielded (container markers, not
+    content). Unclosed (orphan) fence behaves CommonMark-style: runs to EOF.
+    """
+    fence_open = None  # (char, length, has_info) when inside a fence, else None
+    for i, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if marker is not None:
+            if fence_open is None:
+                fence_open = marker
+            elif (marker[0] == fence_open[0]
+                  and marker[1] >= fence_open[1]
+                  and not marker[2]):  # info-string lines cannot close
+                fence_open = None
+            continue
+        if fence_open is None:
+            yield i, line
+
+
+def _iter_top_level_header_names(text):
+    """Yield ## header names from top-level (outside fenced code blocks).
+
+    Returns the captured name without trimming whitespace — `_validate_section_name`
+    rejects leading/trailing whitespace, so a name harvested here is already either
+    well-formed (passes validation) or malformed (caller drops via validator). Not
+    stripping preserves round-trip: harvested name matches the on-disk `## <name>`
+    line exactly so downstream comparisons (e.g., section_exists, registry round-trip)
+    don't desync with reality.
+    """
+    for _, line in _iter_top_level_lines(text.split("\n")):
+        m = re.match(r"^## (.+?)\s*$", line)
+        if m:
+            yield m.group(1)
+
+
 def _extract_all_headers(text):
-    """Return all ## header names from text."""
-    return [m.group(1).strip() for m in re.finditer(r"(?m)^## (.+)$", text)]
+    """Return all valid top-level ## header names (fence-aware, validator-filtered).
+
+    Fenced `## ` lines are skipped. Names failing `_validate_section_name` are
+    silently dropped — a crafted HANDOFF.md from a compromised remote could
+    otherwise inject names containing '<!--' / '-->' / ',' / line terminators
+    that bypass the validator applied on the registry-comment path.
+    """
+    out = []
+    for name in _iter_top_level_header_names(text):
+        try:
+            _validate_section_name(name)
+        except ValueError:
+            continue
+        out.append(name)
+    return out
 
 
 def read_file(path):
@@ -35,11 +119,32 @@ def write_file(path, text):
 
 
 def read_registry(text):
-    """Parse <!-- registry: name1, name2, ANY --> comment. Returns list or None if absent."""
+    """Parse <!-- registry: name1, name2, ANY --> comment. Returns list or None.
+
+    Returns None when:
+      - the comment is absent, or
+      - any entry fails _validate_section_name (a crafted HANDOFF.md from a
+        compromised remote injecting line terminators or '<!--'/'-->' sequences).
+
+    Returning None on any malformed entry forces the caller to fall back to
+    _extract_all_headers, which scans actual headers in the file body. Without
+    this, dropping just one entry would silently shrink the boundary set and
+    cause adjacent section bodies to merge — exfiltrating one device's tasks
+    into another's.
+    """
     m = re.search(r"<!--\s*registry:\s*(.+?)\s*-->", text)
     if not m:
         return None
-    names = [n.strip() for n in m.group(1).split(",") if n.strip()]
+    names = []
+    for raw in m.group(1).split(","):
+        n = raw.strip()
+        if not n:
+            continue
+        try:
+            _validate_section_name(n)
+        except ValueError:
+            return None  # untrusted registry; fall back to header-scan path
+        names.append(n)
     # ANY is always implicitly included
     if "ANY" not in names:
         names.append("ANY")
@@ -76,28 +181,48 @@ def _get_device_names(text):
     return _extract_all_headers(text)
 
 
-def _build_boundary_pattern(text):
-    """Build a lookahead pattern that only matches registered device section headers."""
-    names = _get_device_names(text)
-    if names:
-        escaped = "|".join(re.escape(n) for n in names)
-        return rf"(?=^## (?:{escaped})\s*$|\Z)"
-    # Legacy fallback: match any ## header
-    return r"(?=^## |\Z)"
-
-
 def section_exists(text, name):
-    """Check if a ## section exists in the markdown text."""
-    pattern = rf"(?m)^## {re.escape(name)}\s*$"
-    return bool(re.search(pattern, text))
+    """Check if a ## section exists at top level (outside fenced code blocks).
+
+    Fence awareness matches the rest of the header API; a `## name` line buried
+    in a task body's code fence must not register as a real section, otherwise a
+    crafted HANDOFF.md from a compromised remote could block legitimate device
+    registration by reserving the name inside a fence.
+    """
+    pat = re.compile(rf"^## {re.escape(name)}\s*$")
+    for _, line in _iter_top_level_lines(text.split("\n")):
+        if pat.match(line):
+            return True
+    return False
 
 
 def extract_section_body(text, name):
-    """Extract the body content of a named section. Returns None if not found."""
-    boundary = _build_boundary_pattern(text)
-    pattern = rf"(?m)^## {re.escape(name)}\s*\n(.*?){boundary}"
-    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
-    return m.group(1).strip() if m else None
+    """Extract the body content of a named section, fence-aware.
+
+    Walks lines through `_iter_top_level_lines` (skips fenced code blocks) instead
+    of running a `MULTILINE` regex against the raw text — otherwise a `## DeviceName`
+    line buried in a task body's code fence would prematurely terminate the body
+    extraction. Returns None if no top-level header matches `name`.
+    """
+    lines = text.split("\n")
+    target_header = f"## {name}"
+    target_index = None
+    next_boundary = None
+    for i, line in _iter_top_level_lines(lines):
+        stripped = line.rstrip()
+        if target_index is None:
+            if stripped == target_header:
+                target_index = i
+        else:
+            if stripped.startswith("## "):
+                next_boundary = i
+                break
+    if target_index is None:
+        return None
+    end = next_boundary if next_boundary is not None else len(lines)
+    # Skip the header line itself; collect everything up to (not including) the next boundary
+    body = "\n".join(lines[target_index + 1:end])
+    return body.strip()
 
 
 def _modify_registry(text, modify_fn):
@@ -109,10 +234,31 @@ def _modify_registry(text, modify_fn):
     return text
 
 
-def _is_fence_line(line):
-    """Line starts a code fence (``` or ~~~ after optional indent)."""
-    stripped = line.lstrip()
-    return stripped.startswith("```") or stripped.startswith("~~~")
+def _fence_marker(line):
+    """Return (char, run_length, has_info_string) if this line is a fence marker, else None.
+
+    CommonMark rules honored here:
+      - Indent of 4+ spaces makes the line an indented code block, NOT a fence.
+      - Fence opener is at least 3 of '`' or '~'.
+      - Closer must use the same character, be at least as long as the opener,
+        AND have NO trailing non-whitespace (info string disqualifies a closer).
+
+    Callers track the active opener tuple and may only close when the new marker
+    matches char + length >= opener AND has_info_string is False. Lines like
+    "```python" are valid openers (info='python') but not valid closers.
+    """
+    indent = len(line) - len(line.lstrip(" "))
+    if indent >= 4:
+        return None  # indented code block, not a fence (CommonMark §4.4)
+    stripped = line[indent:]
+    for ch in ("`", "~"):
+        if stripped.startswith(ch * 3):
+            run = 0
+            while run < len(stripped) and stripped[run] == ch:
+                run += 1
+            has_info = bool(stripped[run:].strip())
+            return (ch, run, has_info)
+    return None
 
 
 def add_section(text, name):
@@ -126,18 +272,11 @@ def add_section(text, name):
     Also rejects names containing newlines (sync.sh wraps with `tr -d '\r\n'` but
     direct Python callers need defense-in-depth).
     """
-    if "\n" in name or "\r" in name:
-        raise ValueError("设备名不能包含换行字符")
+    _validate_section_name(name)
     new_section_lines = [f"## {name}", "", "(none)", ""]
     lines = text.split("\n")
-    in_code_fence = False
     insert_index = None
-    for i, line in enumerate(lines):
-        if _is_fence_line(line):
-            in_code_fence = not in_code_fence
-            continue
-        if in_code_fence:
-            continue
+    for i, line in _iter_top_level_lines(lines):
         if line.rstrip() == "## ANY":
             insert_index = i
             break
@@ -146,6 +285,9 @@ def add_section(text, name):
     # Insert new-section block + trailing blank line before the ## ANY line
     lines[insert_index:insert_index] = new_section_lines + [""]
     result = "\n".join(lines)
+    # Collapse runs of 3+ blank lines that accumulate from repeated add_section calls
+    # (the existing blank before `## ANY` plus our trailing blank double up otherwise)
+    result = re.sub(r"\n{3,}", "\n\n", result)
     # Update registry
     result = _modify_registry(result, lambda reg: reg if name in reg else reg + [name])
     return result
@@ -159,25 +301,34 @@ def remove_section(text, name):
     unrelated content).
     """
     lines = text.split("\n")
-    in_code_fence = False
     # Collect device-section-header indices (non-fenced `## <Name>` lines)
     boundary_indices = []
     target_index = None
     target_header = f"## {name}"
-    for i, line in enumerate(lines):
-        if _is_fence_line(line):
-            in_code_fence = not in_code_fence
-            continue
-        if in_code_fence:
-            continue
+    for i, line in _iter_top_level_lines(lines):
         stripped = line.rstrip()
         if stripped.startswith("## "):
             boundary_indices.append(i)
             if stripped == target_header and target_index is None:
                 target_index = i
     if target_index is None:
-        # Nothing to remove; still normalize whitespace + registry for idempotency
+        # Fence-aware scan didn't find the section. Two cases:
+        # (a) the section was already removed → safe to drop from registry (idempotent)
+        # (b) the section EXISTS in the file at top level but the fence-aware scan was
+        #     defeated by an unclosed fence earlier in the file (compromised remote, or
+        #     user-typo unclosed fence) → touching the registry would deregister the
+        #     device while leaving the section body orphaned and unreachable.
+        # The fence-blind raw regex distinguishes these: it matches a `## NAME` line
+        # regardless of fence state, so it sees case (b)'s real header that fence-aware
+        # iteration skips. (Trade-off: if a closed code-fence elsewhere in the file
+        # contains `## NAME` as example text, this raw check also matches it and would
+        # block a legitimate idempotent registry cleanup. That false-positive is rare
+        # and recoverable by manual edit; the unclosed-fence attack is data-loss
+        # preventing, so we accept the trade-off in this direction.)
+        # Whitespace normalization is always safe.
         result = re.sub(r"\n{3,}", "\n\n", text)
+        if re.search(rf"(?m)^## {re.escape(name)}\s*$", result):
+            return result  # case (b): keep registry consistent with on-disk content
         return _modify_registry(result, lambda reg: [n for n in reg if n != name])
     # Find the next non-fenced ## header after target_index (section end)
     next_boundaries = [b for b in boundary_indices if b > target_index]
@@ -196,13 +347,29 @@ def list_devices(text):
 
 
 def migrate_format(text):
-    """Add registry comment to legacy HANDOFF.md (idempotent)."""
+    """Add registry comment to legacy HANDOFF.md (idempotent).
+
+    Aborts migration (returns text unchanged) when any top-level `## Name` header
+    fails `_validate_section_name`. Reason: writing a partial registry would let
+    invalid-name headers pass through unrecognized, while downstream code paths
+    that consult `read_registry` would see a truncated trusted set — staying in
+    legacy/no-registry mode keeps every `## ` line treated as a real boundary by
+    the line-walking extractors.
+
+    Both the raw count and the validated-name extract use the same fence-aware
+    iteration (`_iter_top_level_header_names`) — a fenced `## Foo` in a task body
+    must NOT be counted as a real header on either side, otherwise an attacker
+    could plant a fenced injection that increments both counts equally and slips
+    past the equality check.
+    """
     if read_registry(text) is not None:
         return text  # Already migrated
-    # Discover devices using legacy method
+    raw_names = list(_iter_top_level_header_names(text))
     devices = _extract_all_headers(text)
     if not devices:
         return text  # Nothing to migrate
+    if len(devices) != len(raw_names):
+        return text  # Refuse to migrate when any name fails validation
     return write_registry(text, devices)
 
 
@@ -250,6 +417,12 @@ if __name__ == "__main__":
             print(name)
 
     elif cmd == "get_pending":
+        # Output format (display-only, not for parsing): per matching target,
+        #   [<target_name>]\n<body_text>\n\n
+        # The current sync.sh caller only checks non-emptiness and prints to a
+        # banner — body content may itself contain lines starting with '['.
+        # If a future caller needs to parse this, switch to a structured format
+        # (e.g., JSON) rather than relying on the [name] header.
         for target, body in get_pending_tasks(read_file(sys.argv[2]), *sys.argv[3:]):
             print(f"[{target}]")
             print(body)

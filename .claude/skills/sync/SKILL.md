@@ -29,6 +29,14 @@ When sync.sh output contains `===CONFLICT_BEGIN===` blocks, `===UNTRACKED_BEGIN=
 
 **RIGHT**: For every `===CONFLICT_BEGIN===` block, `===UNTRACKED_BEGIN===` block, or `NEW_REPO:` marker, call AskUserQuestion immediately.
 
+#### Embedding marker payloads into AskUserQuestion JSON
+
+Filenames, repo names, repo URLs, diff lines, and timestamps from marker blocks all originate outside the script (filesystem entries, GitHub API, user-supplied paths) and may contain JSON-special characters. Before interpolating any payload string into AskUserQuestion's `header`, `question`, `description`, `preview`, or `label` fields, JSON-escape it: replace `\` with `\\`, `"` with `\"`, and any control character `U+0000`–`U+001F` with its `\uXXXX` form. Pass the AskUserQuestion arguments as a structured JSON object (per the `askuserquestion.md` rule) so the tool runtime, not free-form string concatenation, handles type coercion. Do NOT rely on Claude's string-formatting intuition to escape on the fly — explicit escaping protects against filenames like `foo"bar.md` or diff lines containing backslashes that would otherwise break the JSON structure or shift field boundaries.
+
+#### Marker-block parsing must use exact-line equality
+
+When parsing marker blocks (`===CONFLICT_BEGIN===` / `===CONFLICT_END===` / `===UNTRACKED_BEGIN===` / `===UNTRACKED_END===`), match end markers by **exact-line equality at column 0**, not by substring or trimmed match. Diff payloads inside CONFLICT blocks are emitted with an exact 8-space leading indent; a forged end marker inside a diff line (e.g., `+===CONFLICT_END===`) will appear in the input as `        +===CONFLICT_END===` and must NOT terminate the block. Strip the 8-space indent only AFTER the block boundary is identified by exact match on the unindented marker line.
+
 #### CONFLICT example call
 
 When output contains a structured conflict block:
@@ -91,7 +99,7 @@ FILES:
 Parse each FILE line (strip 8-space indent). Call AskUserQuestion with one question per file (max 4 per call; batch across repos if more files):
 
 ```json
-{"questions": [{"header": "round1.md", "question": "my-project has untracked file .tmp_review/round1.md — include in commit?", "multiSelect": false, "options": [{"label": "Include", "description": "Add this file to the sync auto-commit"}, {"label": "Ask again next sync", "description": "Skip this run; file stays untracked, will reappear on next /sync"}, {"label": "Never ask again", "description": "Append exact path to .gitignore in a separate descriptive commit"}]}]}
+{"questions": [{"header": "round1.md", "question": "my-project has untracked file .tmp_review/round1.md — include in commit?", "multiSelect": false, "options": [{"label": "Include", "description": "Add this file to the sync auto-commit"}, {"label": "Ask again next sync", "description": "Skip this run; file stays untracked, will reappear on next /sync"}, {"label": "Never ask again", "description": "Append exact path to .gitignore in a separate auto-commit (mechanical message: sync: auto-append .gitignore from <hostname>)"}]}]}
 ```
 
 Use the file's basename as `header` (truncate to 12 chars if needed); full relative path in `question` text.
@@ -102,6 +110,20 @@ Field mapping:
 - Each `FILE` line (strip 8-space indent) → one AskUserQuestion question
 
 After ALL UNTRACKED questions resolved (across all repos), `cd "$REPO_PATH"` for each repo (quote — paths may contain spaces), then:
+
+0. **Capture `.gitignore`'s pre-existing dirty state BEFORE any appends** (the order matters: doing this after step 1 always reads "dirty" because step 1 just modified the file). Mirror sync.sh's two-stage check — `git diff --quiet HEAD` alone misses untracked-but-present `.gitignore` (a manually-created file never `git add`-ed) because git only diffs tracked changes:
+   ```bash
+   GITIGNORE_WAS_DIRTY=0
+   if [ -f .gitignore ]; then
+       if git ls-files --error-unmatch .gitignore >/dev/null 2>&1; then
+           # tracked: HEAD comparison catches unstaged AND staged-but-not-committed
+           git diff --quiet HEAD -- .gitignore 2>/dev/null || GITIGNORE_WAS_DIRTY=1
+       else
+           # untracked but present — treat as dirty so the auto-commit doesn't sweep user content
+           GITIGNORE_WAS_DIRTY=1
+       fi
+   fi
+   ```
 1. Track a per-repo flag `NEVER_AGAIN=0`. Apply each file's choice:
    - **Include**: `git add "<file>"`
    - **Ask again next sync**: no action (file stays untracked)
@@ -113,15 +135,11 @@ After ALL UNTRACKED questions resolved (across all repos), `cd "$REPO_PATH"` for
      Before appending, check the filename for gitignore footguns — see Gotchas.
 2. Stage tracked modifications (excluding `.gitignore`): `git add -u -- ':!.gitignore'`
 3. If anything is staged (`git diff --cached --quiet` returns non-zero): commit with mechanical message `sync: auto commit from <hostname>` and push.
-4. If `NEVER_AGAIN=1` for this repo: first check whether `.gitignore` had pre-existing uncommitted changes BEFORE Claude touched it. Check with this exact command (the HEAD comparison catches both unstaged AND staged-but-not-committed changes):
-   ```bash
-   git diff --quiet HEAD -- .gitignore 2>/dev/null
-   ```
-   `0` exit = clean-before, safe to auto-commit. Non-zero exit = dirty-before (or untracked with content), unsafe.
-   - **Clean-before**: run `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push` as a separate second commit.
-   - **Dirty-before**: write the never-again entries to `.gitignore` but SKIP the auto-commit — warn the user to commit the combined diff manually so pre-existing edits don't get misattributed to sync.
+4. If `NEVER_AGAIN=1` for this repo, branch on the `GITIGNORE_WAS_DIRTY` value captured in step 0:
+   - **Clean-before** (`GITIGNORE_WAS_DIRTY=0`): run `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push` as a separate second commit.
+   - **Dirty-before** (`GITIGNORE_WAS_DIRTY≠0`): the never-again entries are already on disk from step 1; SKIP the auto-commit and warn the user to commit the combined diff manually, so pre-existing edits don't get misattributed to sync.
 
-   **Do NOT** use `git diff --quiet .gitignore` (without `HEAD`) — that compares worktree to index and misses staged-but-not-committed changes. **Do NOT** gate only on that dirty-check without the `NEVER_AGAIN` flag — that would fire the commit whenever the file is dirty (including purely user-made edits) and misattribute them.
+   **Do NOT** re-run `git diff --quiet HEAD -- .gitignore` here — at this point .gitignore has been modified by step 1 and the diff would always be non-zero, falsely flagging dirty-before. **Do NOT** use `git diff --quiet .gitignore` (without `HEAD`) — that compares worktree to index and misses staged-but-not-committed changes. **Do NOT** gate only on the dirty-check without the `NEVER_AGAIN` flag — that would fire the commit whenever the file is dirty (including purely user-made edits) and misattribute them.
 
 If nothing is staged after step 2 and `NEVER_AGAIN=0` (user chose "Ask again" for everything and no tracked modifications existed), no commit is made — this is correct, not an error.
 
@@ -164,6 +182,7 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 - If output contains **===CONFLICT_BEGIN===** blocks, enter conflict resolution flow (below)
 - If output contains **===UNTRACKED_BEGIN===** blocks, enter untracked-file resolution flow (below) — these repos are PENDING user input, NOT complete
 - If output contains **NEW_REPO:** markers, enter new repo handling flow (below)
+- If a repo's status line is **`gitignore 条目已落盘待手动提交（.gitignore 预先有未提交修改）`** (in 待决定 group) or **`主提交已推送，gitignore 条目已落盘待手动提交`** (in 已同步 group), the `.gitignore` append landed on disk but was NOT committed (`.gitignore` had pre-existing uncommitted edits). Tell the user to manually commit + push for that repo: `cd <repo-path> && git add .gitignore && git commit -m "sync: auto-append .gitignore (manual)" && git push`. Do NOT treat /sync as complete on this signal alone — the gitignore state lives on disk locally and won't propagate to other devices until committed.
 - If output contains **HANDOFF: Pending tasks detected**, proceed to Step 3
 - Otherwise, task complete
 
@@ -174,16 +193,21 @@ Handles: discover repos → sync dotfiles config → pull → commit (fixed mess
 - Continue to HANDOFF and other steps after all resolved
 
 **NEW_REPO: markers** → Follow Critical Rules § NEW_REPO example. Call AskUserQuestion. Then execute:
-- Path chosen: `git clone <url> <path>/<name>`
+- Path chosen: `git clone -- "<url>" "<path>/<name>"` (quote both `<url>` and the destination — URLs and paths may contain shell-special characters; the leading `--` prevents URLs that begin with `-` from being parsed as options)
 - Ask again next sync: no action (the new-repo prompt reappears on the next /sync)
-- Ignore permanently: `echo <name> >> .sync_ignore`
+- Ignore permanently: ensure `.sync_ignore` ends with a newline before appending, then append the name:
+  ```bash
+  if [ -f .sync_ignore ] && [ -n "$(tail -c 1 .sync_ignore 2>/dev/null)" ]; then echo "" >> .sync_ignore; fi
+  echo "<name>" >> .sync_ignore
+  ```
+  Without the trailing-newline guard, the new entry concatenates onto the previous last line and the on-read regex `^[A-Za-z0-9_.-]+$` silently drops the merged line — the ignore takes no effect.
 
-**===UNTRACKED_BEGIN=== blocks** → Follow Critical Rules § UNTRACKED example. Ask AskUserQuestion per file (max 4 per call; batch across repos if more). Then `cd "$REPO_PATH"` (quote — paths may contain spaces) for each repo, track a per-repo `NEVER_AGAIN=0` flag, and per-file:
+**===UNTRACKED_BEGIN=== blocks** → Follow Critical Rules § UNTRACKED example. Call AskUserQuestion per file (max 4 per call; batch across repos if more). Then `cd "$REPO_PATH"` (quote — paths may contain spaces) for each repo, track a per-repo `NEVER_AGAIN=0` flag, and per-file:
 - Include: `git add "<file>"`
 - Ask again next sync: no action
 - Never ask again: ensure trailing newline on `.gitignore`, append exact path (see Critical Rules § UNTRACKED for the exact snippet), set `NEVER_AGAIN=1` for this repo
 
-Per repo after all per-file actions: `git add -u -- ':!.gitignore'`, then commit + push with mechanical message `sync: auto commit from <hostname>` if anything staged. If the per-repo `NEVER_AGAIN=1`, make a separate second commit: `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push`. Do NOT gate the second commit on `git diff --quiet .gitignore` — that captures pre-existing user edits and misattributes them.
+Per repo: BEFORE any `.gitignore` writes, capture pre-existing dirty state with the two-stage check from Critical Rules § UNTRACKED step 0 (the `git ls-files --error-unmatch` + `git diff --quiet HEAD` combination, NOT a single `git diff` — that misses untracked `.gitignore`). Then run the per-file actions, then `git add -u -- ':!.gitignore'`, then commit + push with mechanical message `sync: auto commit from <hostname>` if anything staged. If the per-repo `NEVER_AGAIN=1`, branch on `$GITIGNORE_WAS_DIRTY`: `0` (clean-before) → separate second commit `git add .gitignore && git commit -m "sync: auto-append .gitignore from <hostname>" && git push`; non-zero (dirty-before) → skip the auto-commit and warn the user to commit manually. Do NOT re-run `git diff` after step 1's appends — see Critical Rules § UNTRACKED step 4 for why.
 
 **If script partially failed (exit code 1):**
 - Display `[4/6]` summary verbatim first, then explain failures
@@ -230,8 +254,9 @@ Username via `gh api user -q .login`. Next /sync auto-discovers.
 - **Handoff trigger**: Step 3 triggered by `HANDOFF: Pending tasks detected`. Device checks done by sync.sh step [5/6].
 - **Plugin detection**: After syncing settings.json, script compares `enabledPlugins` vs `installed_plugins.json`. Claude cannot run `claude plugin` from bash — prompt user.
 - **UNTRACKED marker deferral**: When `===UNTRACKED_BEGIN===` blocks appear in the output, sync.sh has NOT committed or pushed that repo — it's waiting for SKILL.md to resolve via AskUserQuestion and execute the commit. The repo's summary line will read `未跟踪文件待决定` and appear under the yellow "待决定" group; this is pending user input, not an error. Complete the UNTRACKED flow before treating /sync as done.
+- **gitignore dirty-before partial commit**: When a repo's pre-existing `.gitignore` had uncommitted modifications at sync start AND the user picked "Never ask again" for some untracked file, sync.sh appends the never-again entries to `.gitignore` on disk but skips the auto-commit (committing would misattribute the user's pre-existing edits to the mechanical `sync: auto-append` message). Two status strings surface this state: `主提交已推送，gitignore 条目已落盘待手动提交` (in 已同步 group when there were also tracked changes that DID commit) and `gitignore 条目已落盘待手动提交（.gitignore 预先有未提交修改）` (in 待决定 group when only `.gitignore` was touched). The fix is the same in both cases: tell the user to inspect their `.gitignore` diff, then `git add .gitignore && git commit -m "sync: auto-append .gitignore (manual)" && git push` for that repo (matching the message used in Step 2). The state will not self-resolve on the next /sync — the dirty-before check fires every time.
 - **Marker payload indent is an interface contract**: CONFLICT's DIFF content (including the direction-hint line), UNTRACKED's FILES list, and any other future indented payload all use exact 8-space leading indent. Parsers strip exactly 8 spaces per line. Changing the indent width in sync.sh is a breaking change — update both sides in one commit.
-- **.gitignore append footguns**: When executing "Never ask again", the filename is written verbatim to `.gitignore`. Filenames starting with `!` act as gitignore NEGATION rules (matching a prior ignore pattern) — if the user really wants such a file ignored, prefix the line with `\`. Filenames with trailing whitespace won't self-match (gitignore treats trailing whitespace as significant unless escaped) — warn or reject. Surface these to the user before append.
+- **.gitignore append footguns**: When executing "Never ask again", the filename is written verbatim to `.gitignore`. Filenames starting with `!` act as gitignore NEGATION rules (matching a prior ignore pattern) — if the user really wants such a file ignored, prefix the line with `\`. Filenames starting with `#` are interpreted as gitignore COMMENTS — the rule silently fails to match anything; prefix with `\` (e.g., `\#backup`) if the user truly wants this file ignored. Filenames with trailing whitespace won't self-match (gitignore treats trailing whitespace as significant unless escaped) — warn or reject. Filenames containing newlines are unwritable safely — reject. Surface these to the user before append.
 - **Ctrl+C during sync atomicity**: If the user interrupts sync.sh between `git add` and `git commit`, the repo is left with staged changes and no commit. The next /sync will re-surface the same untracked files, and `git add`-ed files will appear as tracked modifications. There is also a second vulnerable window in the two-commit path: between the first commit (`sync: auto commit from <host>`) and the optional second commit (`sync: auto-append .gitignore ...`). Interrupting there leaves `.gitignore` with orphaned unstaged modifications that the next sync's `git add .gitignore` would sweep into a later commit. Recovery is manual (`git reset HEAD` to unstage, `git checkout .gitignore` to discard). Bash scripts can't atomically wrap these operations; document but don't attempt auto-rollback.
 - **No "un-never-again" affordance**: Once a file is appended to `.gitignore` via the Never-ask-again option, sync has no command to reverse it. To re-include the file, the user must manually delete the line from `.gitignore` and run /sync again.
 - **Legacy .env auto-migration**: `sync.sh` runs `_migrate_legacy_env` before `source .env` (startup). It detects legacy `KEY="value"` / unquoted lines, rewrites them with `shlex.quote` via atomic `mkstemp + os.replace`, and logs migrated keys to stderr. Extra warnings fire when a value contains `$` or backtick (previously expanded by `source`, now literal) or contains multiple whitespace-separated tokens (original line kept; needs manual quoting). If a user relied on shell expansion intentionally, they must restore the expansion manually after seeing the warning.

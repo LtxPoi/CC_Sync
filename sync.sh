@@ -48,6 +48,14 @@ run_first_run_wizard() {
             continue
         fi
 
+        # 拒绝会破坏 marker 契约的字符：'|' 是 CONFLICT/UNTRACKED 块的字段分隔符；
+        # 制表符在 SKILL.md 解析剥 8-空格缩进时位置不稳定。shlex.quote 已经保护
+        # source .env 安全，这里挡的是 marker payload 这条下游路径。
+        if [[ "$dotfiles_path" == *"|"* ]] || [[ "$dotfiles_path" == *$'\t'* ]]; then
+            echo "路径不能包含 '|' 或制表符。请重新输入。"
+            continue
+        fi
+
         # Check parent dir exists
         local parent_dir
         parent_dir=$(dirname "$dotfiles_path")
@@ -132,16 +140,30 @@ run_first_run_wizard() {
         echo ""
         read -p "请输入路径：" ws_roots
         ws_roots=$(echo "$ws_roots" | tr -d '\r\n')
+        # 同 dotfiles_path：'|' 会污染 marker 输出；制表符破坏 8 空格缩进契约
+        if [[ "$ws_roots" == *"|"* ]] || [[ "$ws_roots" == *$'\t'* ]]; then
+            echo -e "${YELLOW}警告：检测到 '|' 或制表符；这些字符会破坏 sync 输出契约，已剔除。${NC}"
+            ws_roots=$(echo "$ws_roots" | tr -d '|\t')
+        fi
+        # strip 后可能整串为空（用户只输入了 '|'），需要再 fail-fast，否则 .env 写入空 WORKSPACE_ROOTS
+        # 而 ENABLE_REPO_SYNC=true，下次 sync 会静默 fall back 到 WORKSPACE_ROOT 默认值
+        if [ -z "$ws_roots" ]; then
+            echo "剔除非法字符后路径为空，项目仓库同步未启用。如需启用请重新运行向导。"
+            enable_repo="false"
+        fi
 
-        # 【第 2b 步】TOPIC
-        echo ""
-        echo "【第 2b 步】你给 GitHub 仓库贴的标签（topic）叫什么？"
-        echo ""
-        echo "  sync 通过这个标签来发现你想同步的仓库。"
-        echo "  如果你还没贴过标签，建议用默认值，直接回车即可。"
-        echo ""
-        read -p "请输入标签名（回车使用默认值 claude-code-workspace）：" topic
-        topic="${topic:-claude-code-workspace}"
+        # 仓库同步真的启用时才追问 TOPIC（被强制关闭后还问 topic 读起来像自相矛盾）
+        if [ "$enable_repo" = "true" ]; then
+            # 【第 2b 步】TOPIC
+            echo ""
+            echo "【第 2b 步】你给 GitHub 仓库贴的标签（topic）叫什么？"
+            echo ""
+            echo "  sync 通过这个标签来发现你想同步的仓库。"
+            echo "  如果你还没贴过标签，建议用默认值，直接回车即可。"
+            echo ""
+            read -p "请输入标签名（回车使用默认值 claude-code-workspace）：" topic
+            topic="${topic:-claude-code-workspace}"
+        fi
     fi
 
     # Write .env via Python (UTF-8 safe)
@@ -460,8 +482,25 @@ if [ "${1:-}" = "repo-sync" ]; then
                 echo "仓库 $name 不在 .sync_ignore 中" >&2
                 exit 1
             fi
+            # 非原子写：grep > tmp 后 mv 替换。.sync_ignore 不是安全敏感文件
+            # （读时 [A-Za-z0-9_.-]+ 正则过滤），且本子命令是手动单次运行，
+            # 不在并发关键路径上 —— 引入 mkstemp+os.replace 的复杂度不值
+            # grep exit codes: 0=有匹配 / 1=无匹配（这里 = 文件被全部过滤空，合法）/ 2=I/O 错误。
+            # sync.sh 没开 set -e，所以 grep 返 rc=1 不会让脚本中断；直接捕获 $? 即可。
+            # 不要用 `|| true` + PIPESTATUS：PIPESTATUS 在 `|| true` 后反映的是 true 的 rc=0，
+            # 区分 1 vs 2 失效。
             grep -Fvx "$name" "$IGNORE_FILE" > "${IGNORE_FILE}.tmp"
-            mv "${IGNORE_FILE}.tmp" "$IGNORE_FILE"
+            _grep_rc=$?
+            if [ "$_grep_rc" -gt 1 ]; then
+                rm -f "${IGNORE_FILE}.tmp"
+                echo -e "${RED}写入临时文件失败${NC}" >&2
+                exit 1
+            fi
+            if ! mv "${IGNORE_FILE}.tmp" "$IGNORE_FILE"; then
+                rm -f "${IGNORE_FILE}.tmp"
+                echo -e "${RED}替换 .sync_ignore 失败${NC}" >&2
+                exit 1
+            fi
             echo -e "${GREEN}已从 .sync_ignore 中移除 $name${NC}"
             ;;
         enable)
@@ -469,7 +508,7 @@ if [ "${1:-}" = "repo-sync" ]; then
                 echo ".env 文件不存在，请先运行 bash sync.sh 完成首次配置" >&2
                 exit 1
             fi
-            source "$ENV_FILE"
+            # .env 已在脚本启动早期 source（line ~290），变量已就绪
             if [ "${ENABLE_REPO_SYNC:-false}" = "true" ]; then
                 echo "项目仓库同步已启用，无需操作"
                 exit 0
@@ -483,6 +522,16 @@ if [ "${1:-}" = "repo-sync" ]; then
                 echo "路径不能为空" >&2
                 exit 1
             fi
+            # marker 契约保护：见 wizard 同款注释
+            if [[ "$ws_roots" == *"|"* ]] || [[ "$ws_roots" == *$'\t'* ]]; then
+                echo -e "${YELLOW}警告：检测到 '|' 或制表符；这些字符会破坏 sync 输出契约，已剔除。${NC}" >&2
+                ws_roots=$(echo "$ws_roots" | tr -d '|\t')
+            fi
+            # strip 后再 fail-fast：用户只输入 '|' 等非法字符时不能写空 WORKSPACE_ROOTS
+            if [ -z "$ws_roots" ]; then
+                echo -e "${RED}剔除非法字符后路径为空${NC}" >&2
+                exit 1
+            fi
             read -p "$(printf '你给 GitHub 仓库贴的标签（topic）叫什么？\n（回车使用默认值 claude-code-workspace）：')" topic
             topic="${topic:-claude-code-workspace}"
             # Update .env via Python (with mkdir-based lock)
@@ -494,41 +543,54 @@ if [ "${1:-}" = "repo-sync" ]; then
             fi
             trap 'rmdir "'"$_lockdir"'" 2>/dev/null' EXIT INT TERM
             python -c "
-import shlex, sys
+import os, shlex, sys, tempfile
 env_path = sys.argv[1]
 ws = sys.argv[2]
 tp = sys.argv[3]
-lines = []
 with open(env_path, 'r', encoding='utf-8') as f:
     lines = f.readlines()
 enable_found = False
 ws_found = False
 tp_found = False
+out_lines = []
 # shlex.quote 生成 single-quoted 形式，禁止 source .env 时展开 \$/backtick/\\
-with open(env_path, 'w', encoding='utf-8', newline='\n') as f:
-    for line in lines:
-        if line.startswith('ENABLE_REPO_SYNC='):
-            f.write('ENABLE_REPO_SYNC=' + shlex.quote('true') + '\n')
-            enable_found = True
-        elif line.startswith('WORKSPACE_ROOTS='):
-            f.write('WORKSPACE_ROOTS=' + shlex.quote(ws) + '\n')
-            ws_found = True
-        elif line.startswith('TOPIC='):
-            f.write('TOPIC=' + shlex.quote(tp) + '\n')
-            tp_found = True
-        else:
-            f.write(line)
-    if not enable_found:
-        f.write('ENABLE_REPO_SYNC=' + shlex.quote('true') + '\n')
-    if not ws_found:
-        f.write('WORKSPACE_ROOTS=' + shlex.quote(ws) + '\n')
-    if not tp_found:
-        f.write('TOPIC=' + shlex.quote(tp) + '\n')
+for line in lines:
+    if line.startswith('ENABLE_REPO_SYNC='):
+        out_lines.append('ENABLE_REPO_SYNC=' + shlex.quote('true') + '\n')
+        enable_found = True
+    elif line.startswith('WORKSPACE_ROOTS='):
+        out_lines.append('WORKSPACE_ROOTS=' + shlex.quote(ws) + '\n')
+        ws_found = True
+    elif line.startswith('TOPIC='):
+        out_lines.append('TOPIC=' + shlex.quote(tp) + '\n')
+        tp_found = True
+    else:
+        out_lines.append(line)
+if not enable_found:
+    out_lines.append('ENABLE_REPO_SYNC=' + shlex.quote('true') + '\n')
+if not ws_found:
+    out_lines.append('WORKSPACE_ROOTS=' + shlex.quote(ws) + '\n')
+if not tp_found:
+    out_lines.append('TOPIC=' + shlex.quote(tp) + '\n')
+# 原子替换：先写 tempfile 再 os.replace，避免半写入（与 _migrate_legacy_env / _append_workspace_root 一致）
+dirpath = os.path.dirname(os.path.abspath(env_path)) or '.'
+fd, tmp_path = tempfile.mkstemp(prefix='.env.enable.', dir=dirpath)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        f.writelines(out_lines)
+    os.replace(tmp_path, env_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
 " "$(normalize_path "$ENV_FILE")" "$ws_roots" "$topic"
-            if [ $? -ne 0 ]; then
+            _py_rc=$?
+            if [ $_py_rc -ne 0 ]; then
                 rmdir "$_lockdir" 2>/dev/null
                 trap - EXIT INT TERM
-                echo -e "${RED}写入 .env 失败${NC}" >&2
+                echo -e "${RED}写入 .env 失败 (python rc=$_py_rc)${NC}" >&2
                 exit 1
             fi
             rmdir "$_lockdir" 2>/dev/null
@@ -538,7 +600,9 @@ with open(env_path, 'w', encoding='utf-8', newline='\n') as f:
             echo -e "${GREEN}已启用项目仓库同步！下次运行 sync 时将自动发现并同步仓库。${NC}"
             ;;
         *)
-            echo "用法: sync.sh repo-sync <enable|unignore> <repo-name>"
+            echo "用法:"
+            echo "  sync.sh repo-sync enable                     启用项目仓库批量同步（交互向导）"
+            echo "  sync.sh repo-sync unignore <repo-name>       从 .sync_ignore 移除指定仓库"
             exit 1
             ;;
     esac
@@ -564,6 +628,12 @@ HAS_ERROR=0
 
 # 并行处理用的临时目录
 SYNC_TMPDIR=$(safe_mktemp)
+# safe_mktemp 静默 fallback 后仍可能返回空串；空串下 rm -rf "" 在 GNU 是 no-op，
+# 在 BSD/macOS 行为不一致，先 fail-fast 比留 EXIT 陷阱兜底更稳妥
+if [ -z "$SYNC_TMPDIR" ] || [ ! -d "$SYNC_TMPDIR" ]; then
+    echo -e "${RED}错误：无法创建临时目录${NC}" >&2
+    exit 1
+fi
 trap 'rm -rf "$SYNC_TMPDIR"' EXIT
 
 echo "========================================="
@@ -577,7 +647,7 @@ echo "[1/6] 发现仓库..."
 declare -A KNOWN_REPOS
 declare -A REPO_URLS
 
-if [ "${ENABLE_REPO_SYNC:-true}" = "false" ]; then
+if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
     # Config-only mode: only find dotfiles repo
     if ! REPOS_JSON=$("$GH" repo list "$GITHUB_USER" --json name,url --limit 1000 2>/dev/null); then
         echo -e "${RED}错误：无法获取仓库列表。${NC}" >&2
@@ -615,7 +685,10 @@ else
     IGNORED_LIST=""
     N_IGNORED=0
     if [ -f "$IGNORE_FILE" ]; then
-        IGNORED_LIST=$(grep -v '^[[:space:]]*#' "$IGNORE_FILE" | grep -v '^[[:space:]]*$' | tr -d '\r' || true)
+        # 第三轮过滤：只保留符合 GitHub repo 名规范的行（字母/数字/下划线/连字符/点）。
+        # 防御一个被篡改的 .sync_ignore（如远端被攻击）混入控制字符或路径分隔符
+        IGNORED_LIST=$(grep -v '^[[:space:]]*#' "$IGNORE_FILE" | grep -v '^[[:space:]]*$' \
+            | tr -d '\r' | grep -E '^[A-Za-z0-9_.-]+$' || true)
         if [ -n "$IGNORED_LIST" ]; then
             N_IGNORED=$(echo "$IGNORED_LIST" | wc -l | tr -d ' ')
         fi
@@ -686,26 +759,26 @@ for repo in data:
     if [ -n "$REPOS" ]; then
         ORPHAN_FOUND=0
         for ws_root in "${WS_ROOTS[@]}"; do
-        for DIR in "${ws_root}"/*/; do
-            [ ! -d "$DIR" ] && continue
-            DIR_NAME=$(basename "$DIR")
-            [[ "$DIR_NAME" == .* ]] && continue
-            [ "${KNOWN_REPOS[$DIR_NAME]+_}" ] && continue
+            for DIR in "${ws_root}"/*/; do
+                [ ! -d "$DIR" ] && continue
+                DIR_NAME=$(basename "$DIR")
+                [[ "$DIR_NAME" == .* ]] && continue
+                [ "${KNOWN_REPOS[$DIR_NAME]+_}" ] && continue
 
-            if [ $ORPHAN_FOUND -eq 0 ]; then
-                echo ""
-                echo -e "${YELLOW}⚠ 检测到未纳入同步的本地目录：${NC}"
-                ORPHAN_FOUND=1
-            fi
+                if [ $ORPHAN_FOUND -eq 0 ]; then
+                    echo ""
+                    echo -e "${YELLOW}⚠ 检测到未纳入同步的本地目录：${NC}"
+                    ORPHAN_FOUND=1
+                fi
 
-            if [ -d "$DIR/.git" ]; then
-                echo -e "${YELLOW}  - ${DIR_NAME}/ （在 ${ws_root}，是 git 仓库，但 GitHub 仓库缺少 ${TOPIC} topic）${NC}"
-                echo -e "${YELLOW}    → gh repo edit ${GITHUB_USER}/${DIR_NAME} --add-topic ${TOPIC}${NC}"
-            else
-                echo -e "${YELLOW}  - ${DIR_NAME}/ （在 ${ws_root}，不是 git 仓库）${NC}"
-                echo -e "${YELLOW}    → 需要 git init + 创建 GitHub 仓库 + 添加 ${TOPIC} topic${NC}"
-            fi
-        done
+                if [ -d "$DIR/.git" ]; then
+                    echo -e "${YELLOW}  - ${DIR_NAME}/ （在 ${ws_root}，是 git 仓库，但 GitHub 仓库缺少 ${TOPIC} topic）${NC}"
+                    echo -e "${YELLOW}    → gh repo edit ${GITHUB_USER}/${DIR_NAME} --add-topic ${TOPIC}${NC}"
+                else
+                    echo -e "${YELLOW}  - ${DIR_NAME}/ （在 ${ws_root}，不是 git 仓库）${NC}"
+                    echo -e "${YELLOW}    → 需要 git init + 创建 GitHub 仓库 + 添加 ${TOPIC} topic${NC}"
+                fi
+            done
         done
 
         if [ $ORPHAN_FOUND -eq 1 ]; then
@@ -839,7 +912,9 @@ sync_config_file() {
     # and Y differ"，单行且安全）。此前的 NUL-byte 启发式误判 UTF-16 文本为二进制，
     # 已在 experience.md entry 1 记录；改用 diff 原生检测消除该类误报。
     # 用 timeout 10s 为病态输入（如单行几十 MB 的压缩 JSON）设上限，防 OOM
-    DIFF_OUTPUT=$(timeout 10s diff --unified=1 "$REPO_FILE" "$LOCAL_FILE" 2>/dev/null | head -20 || true)
+    # head -50：足够大的预览，多数 conflict 都能完整显示；超出时 SKILL.md 端会
+    # 看到截断的 hunk，可接受 —— 增加上限基本免费，UX 提升明显
+    DIFF_OUTPUT=$(timeout 10s diff --unified=1 "$REPO_FILE" "$LOCAL_FILE" 2>/dev/null | head -50 || true)
 
     if [ "$INTERACTIVE" = true ]; then
         # Interactive mode: human-readable output + prompt
@@ -1069,6 +1144,12 @@ except Exception as e:
 
 enabled = settings.get('enabledPlugins') or {}
 marketplaces = settings.get('extraKnownMarketplaces') or {}
+# 类型守卫：CC settings schema 演化后这两键若变成 list/string，下面 .items() / .get() 会崩
+# 既然类型不对就当成"什么都没启用"处理，让 plugin 检测安静返回而不是给个 AttributeError
+if not isinstance(enabled, dict):
+    enabled = {}
+if not isinstance(marketplaces, dict):
+    marketplaces = {}
 
 try:
     with open(installed_path, encoding='utf-8') as f:
@@ -1088,14 +1169,16 @@ for plugin_id, is_enabled in enabled.items():
     if len(parts) != 2:
         continue
     name, mkt = parts
-    mkt_info = marketplaces.get(mkt, {})
-    source = mkt_info.get('source', {})
-    repo = source.get('repo', '')
+    # 用 `or {}`：JSON 显式 null 时 .get(k, default) 仍返回 None，后续 .get 会抛
+    # AttributeError 中断 missing 收集，导致 plugin 检测结果截断（假阴性）
+    mkt_info = marketplaces.get(mkt) or {}
+    source = mkt_info.get('source') or {}
+    repo = source.get('repo') or ''
     missing.append(f'{plugin_id}|{repo}')
 
 for m in missing:
     print(m)
-" "$SETTINGS_PY" "$INSTALLED_PY" 2>/dev/null)
+" "$SETTINGS_PY" "$INSTALLED_PY")
 
     [ -z "$MISSING" ] && return 0
 
@@ -1223,7 +1306,7 @@ else
 fi
 
 # --- 第 3 步：并行处理仓库 ---
-if [ "${ENABLE_REPO_SYNC:-true}" = "false" ]; then
+if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
     echo ""
     echo "[3/6] 项目仓库同步已禁用，跳过"
 else
@@ -1239,12 +1322,6 @@ _repo_fail() {
     echo "${name}|${msg}" > "${SYNC_TMPDIR}/${name}.result"
     touch "${SYNC_TMPDIR}/${name}.error"
     echo -e "${RED}${msg}${NC}"
-}
-
-_repo_ok() {
-    local name="$1" msg="$2"
-    echo "${name}|${msg}" > "${SYNC_TMPDIR}/${name}.result"
-    echo -e "${GREEN}✓${NC} ${msg}"
 }
 
 # 交互式 clone 菜单：新仓库选择 clone 目标
@@ -1311,9 +1388,13 @@ _interactive_clone_menu() {
             echo "正在 clone 到 ${target_dir}..."
             if git clone -- "$repo_url" "$target_dir" 2>&1; then
                 echo -e "${GREEN}克隆完成${NC}"
-                # 自动追加新路径到 .env 的 WORKSPACE_ROOTS
-                _append_workspace_root "$new_path"
-                WS_ROOTS+=("$new_path")
+                # 自动追加新路径到 .env 的 WORKSPACE_ROOTS；只有 .env 写成功才更新内存数组，
+                # 否则下次 /sync 找不到 repo 会一头雾水
+                if _append_workspace_root "$new_path"; then
+                    WS_ROOTS+=("$new_path")
+                else
+                    echo -e "${YELLOW}已 clone 但未能写入 .env：下次 /sync 不会自动发现 ${new_path}${NC}" >&2
+                fi
                 CLONE_RESULT_DIR="$target_dir"
                 return 0
             else
@@ -1346,7 +1427,10 @@ _interactive_clone_menu() {
 # 使用 mkdir-based 锁（与 repo-sync enable 一致），避免并发 sync 同时改 .env 互相覆盖
 _append_workspace_root() {
     local new_root="$1"
-    if [ ! -f "$ENV_FILE" ]; then return; fi
+    # 显式 return 1：caller 用 `if _append_workspace_root ...` 判断成败；
+    # 裸 `return` 会返回 last command 的 rc（这里是 [ ! -f ... ] 的 0=true），
+    # 让 caller 误以为写成功并把 new_root 加进 WS_ROOTS，与磁盘脱节
+    if [ ! -f "$ENV_FILE" ]; then return 1; fi
     local _lockdir="${ENV_FILE}.lock"
     if ! mkdir "$_lockdir" 2>/dev/null; then
         echo -e "${RED}另一个 sync.sh 正在修改 .env，跳过本次 WORKSPACE_ROOTS 追加${NC}" >&2
@@ -1366,7 +1450,7 @@ for line in lines:
     if line.startswith('WORKSPACE_ROOTS='):
         value_part = line.strip().split('=', 1)[1]
         # shlex.split 同时支持 '...' 与 \"...\"，兼容旧 .env 格式
-        # 未闭合引号等异常 → 保留原行（防御 round-6 N-1）
+        # 未闭合引号等异常 → 保留原行，避免盲目截断或丢失数据
         try:
             tokens = shlex.split(value_part) if value_part else []
         except ValueError:
@@ -1399,8 +1483,13 @@ except Exception:
         pass
     raise
 " "$(normalize_path "$ENV_FILE")" "$new_root"
+    local _py_rc=$?
     rmdir "$_lockdir" 2>/dev/null
     trap - RETURN
+    if [ $_py_rc -ne 0 ]; then
+        echo -e "${RED}写入 .env WORKSPACE_ROOTS 失败 (python rc=$_py_rc)${NC}" >&2
+        return 1
+    fi
 }
 
 # 单个仓库的处理函数（在子进程中运行）
@@ -1505,6 +1594,25 @@ _process_repo() {
             # 本轮不提交，由 AI 层决策后在各仓库执行后续 git add/commit/push
             # Format consumed by SKILL.md → UNTRACKED AskUserQuestion flow
             # Do not change field names or delimiters without updating SKILL.md
+            #
+            # 安全检查：若有文件名内含 marker 字符串（=== ... ===），输出会被攻击者
+            # 控制的文件名截断或注入伪造块。检测到就退化为安全模式：保留所有文件
+            # 不变（既不 stage 也不 emit FILES），等用户手动处理
+            local _has_marker_collision=0
+            for _f in "${UNTRACKED_LIST[@]}"; do
+                if [[ "$_f" == *'==='* ]]; then
+                    _has_marker_collision=1
+                    break
+                fi
+            done
+            if [ "$_has_marker_collision" = 1 ]; then
+                echo "${REPO_NAME}|未跟踪文件含可疑名（'===' 字符串），需手动处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                echo "----- ${REPO_NAME} 安全跳过 -----"
+                echo "检测到未跟踪文件名含 '===' 序列，可能干扰 marker 解析。请手动处理后重试。"
+                touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
+                echo ""
+                return
+            fi
             echo "===UNTRACKED_BEGIN==="
             echo "REPO: $REPO_NAME"
             echo "REPO_PATH: $(pwd)"
@@ -1631,6 +1739,8 @@ _process_repo() {
         COMMIT1_DONE=1
     fi
 
+    # COMMIT2_OUTCOME：none / done / dirty-before / failed —— 最终状态消息要按这分支
+    local COMMIT2_OUTCOME="none"
     if [ "$GITIGNORE_APPENDED" = 1 ]; then
         if [ "$GITIGNORE_WAS_DIRTY" = 1 ]; then
             # .gitignore 本轮开始前就有用户未提交的修改 —— 直接 git add .gitignore
@@ -1638,14 +1748,17 @@ _process_repo() {
             # 安全做法：写入文件让 never-again 条目落盘，但本轮不自动提交
             echo -e "${YELLOW}  ⚠ .gitignore 预先存在未提交修改；never-again 条目已追加到文件，但本轮不自动提交。${NC}"
             echo -e "${YELLOW}    请在 ${REPO_NAME} 手动 commit，或下次 /sync 再处理。${NC}"
+            COMMIT2_OUTCOME="dirty-before"
         else
             git add .gitignore
             if ! git commit -m "sync: auto-append .gitignore from $(hostname)"; then
                 # COMMIT2 失败：不 return —— 让 COMMIT1（如果成功）继续 push，避免孤儿化
                 echo -e "${RED}${REPO_NAME} gitignore commit 失败（不影响主提交的 push）${NC}"
                 touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
+                COMMIT2_OUTCOME="failed"
             else
                 COMMIT2_DONE=1
+                COMMIT2_OUTCOME="done"
             fi
         fi
     fi
@@ -1659,10 +1772,42 @@ _process_repo() {
             echo ""
             return
         fi
+        # 至少一次提交成功并已 push；按 COMMIT2_OUTCOME 给出准确状态，避免
+        # "✗ ... 已提交并推送"这种 .error+成功消息的自相矛盾显示
+        case "$COMMIT2_OUTCOME" in
+            failed)
+                echo "${REPO_NAME}|主提交已推送，但 gitignore commit 失败（需 Claude 处理）" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                echo -e "${YELLOW}主提交完成；gitignore 条目本轮未提交${NC}"
+                ;;
+            dirty-before)
+                echo "${REPO_NAME}|主提交已推送，gitignore 条目已落盘待手动提交" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                echo -e "${YELLOW}主提交完成；gitignore 条目落盘但未自动提交${NC}"
+                ;;
+            *)
+                echo "${REPO_NAME}|已提交并推送" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                echo -e "${GREEN}完成${NC}"
+                ;;
+        esac
+    else
+        # 没产生任何 commit。可达路径：HAS_NON_GITIGNORE_STAGED=0 + GITIGNORE_APPENDED=1
+        # 且 COMMIT2_OUTCOME 是 dirty-before 或 failed —— 这两种是"已落盘待人工"的不同原因
+        case "$COMMIT2_OUTCOME" in
+            failed)
+                # .error 已 touch，step 4 走 FAIL 分支
+                echo "${REPO_NAME}|gitignore commit 失败 - 需要 Claude 处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                ;;
+            dirty-before)
+                # 不是 error，是用户操作中转态；step 4 走 PENDING
+                echo "${REPO_NAME}|gitignore 条目已落盘待手动提交（.gitignore 预先有未提交修改）" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                ;;
+            *)
+                # 理论不可达（GITIGNORE_APPENDED=1 必走上面两支之一），保险起见兜底
+                echo "${REPO_NAME}|本轮无 commit 落地" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
+                touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
+                ;;
+        esac
+        echo -e "${YELLOW}本轮 .gitignore 条目已落盘但未自动提交${NC}"
     fi
-
-    echo "${REPO_NAME}|已提交并推送" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
-    echo -e "${GREEN}完成${NC}"
     echo ""
 }
 
@@ -1756,7 +1901,7 @@ done
 fi  # ENABLE_REPO_SYNC gate (step 3)
 
 # --- 第 4 步：汇总 ---
-if [ "${ENABLE_REPO_SYNC:-true}" = "false" ]; then
+if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
     echo "========================================="
     echo "[4/6] 汇总"
     echo "========================================="
@@ -1782,9 +1927,11 @@ else
         if [ -f "${SYNC_TMPDIR}/${NAME}.error" ]; then
             FAIL_ITEMS+=("$NAME|$REPO_STATUS")
         elif [ "$REPO_STATUS" = "未跟踪文件待决定" ] \
-            || [ "$REPO_STATUS" = "新仓库待处理" ]; then
-            # UNTRACKED 或非交互模式下的新仓库：等待 SKILL.md / 用户决策
-            # 用精确匹配而非 *"待决定"*，避免未来新增状态字符串巧合包含子串被误分类
+            || [ "$REPO_STATUS" = "新仓库待处理" ] \
+            || [[ "$REPO_STATUS" == "gitignore 条目已落盘待手动提交"* ]]; then
+            # UNTRACKED / 非交互新仓库 / dirty-before 的 gitignore 落盘待人工：
+            # 等待 SKILL.md / 用户决策。用精确（含 prefix）匹配，防止新增状态串
+            # 巧合包含子串被误分类
             PENDING_ITEMS+=("$NAME|$REPO_STATUS")
         elif [ "$REPO_STATUS" = "已在第 2 步同步" ] \
             || [[ "$REPO_STATUS" == "无改动"* ]] \
@@ -1795,7 +1942,11 @@ else
         elif [ "$REPO_STATUS" = "已提交并推送" ] \
             || [ "$REPO_STATUS" = "已推送未同步的 commit" ] \
             || [ "$REPO_STATUS" = "已拉取远程更新" ] \
-            || [ "$REPO_STATUS" = "新克隆" ]; then
+            || [ "$REPO_STATUS" = "新克隆" ] \
+            || [[ "$REPO_STATUS" == "主提交已推送"* ]]; then
+            # "主提交已推送，gitignore 条目已落盘待手动提交"也是部分成功，归 ACTION
+            # （.error 不在此处置位，所以走到这里就是一致的；commit-fail 路径已经
+            # 在前面被 .error 分支拦截到 FAIL 桶）
             ACTION_ITEMS+=("$NAME|$REPO_STATUS")
         else
             # 未知状态 —— 保守归入 PENDING 并标注，防止新增状态字符串被默认当成成功
@@ -1887,39 +2038,39 @@ else
         if [ "$INTERACTIVE" = false ]; then
             echo "跳过设备注册（非交互模式）"
         else
-        echo -e "${YELLOW}未找到 .machine-name，需要设置设备名称。${NC}"
+            echo -e "${YELLOW}未找到 .machine-name，需要设置设备名称。${NC}"
 
-        while true; do
-            read -p "请输入本设备的名称（如 Desktop、Laptop），留空跳过：" INPUT_NAME
-            INPUT_NAME=$(echo "$INPUT_NAME" | tr -d '\r\n')
+            while true; do
+                read -p "请输入本设备的名称（如 Desktop、Laptop），留空跳过：" INPUT_NAME
+                INPUT_NAME=$(echo "$INPUT_NAME" | tr -d '\r\n')
 
-            if [ -z "$INPUT_NAME" ]; then
-                echo "已跳过，下次 sync 会再次询问。"
-                break
-            fi
-
-            if [ "$(handoff_section_exists "$INPUT_NAME")" = "no" ]; then
-                # Case 1A: 新名字，不存在于 HANDOFF.md
-                read -p "新设备 [$INPUT_NAME]，是否添加到 HANDOFF.md？(y/n) " CONFIRM
-                if [[ "$CONFIRM" =~ ^[Yy] ]]; then
-                    echo "$INPUT_NAME" > "${SCRIPT_DIR}/.machine-name"
-                    if register_handoff_device "$INPUT_NAME"; then
-                        MACHINE_NAME="$INPUT_NAME"
-                        HANDOFF_READY=1
-                    else
-                        rm -f "${SCRIPT_DIR}/.machine-name"
-                        echo -e "${YELLOW}设备注册失败，handoff 功能本次跳过${NC}"
-                    fi
-                else
+                if [ -z "$INPUT_NAME" ]; then
                     echo "已跳过，下次 sync 会再次询问。"
+                    break
                 fi
-                break
-            else
-                # Case 1B: 名字已被注册 — 拒绝重复，防止身份冲突
-                echo -e "${RED}✗ [$INPUT_NAME] 已被其他设备注册，请选择其他名称。${NC}"
-                continue
-            fi
-        done
+
+                if [ "$(handoff_section_exists "$INPUT_NAME")" = "no" ]; then
+                    # Case 1A: 新名字，不存在于 HANDOFF.md
+                    read -p "新设备 [$INPUT_NAME]，是否添加到 HANDOFF.md？(y/n) " CONFIRM
+                    if [[ "$CONFIRM" =~ ^[Yy] ]]; then
+                        echo "$INPUT_NAME" > "${SCRIPT_DIR}/.machine-name"
+                        if register_handoff_device "$INPUT_NAME"; then
+                            MACHINE_NAME="$INPUT_NAME"
+                            HANDOFF_READY=1
+                        else
+                            rm -f "${SCRIPT_DIR}/.machine-name"
+                            echo -e "${YELLOW}设备注册失败，handoff 功能本次跳过${NC}"
+                        fi
+                    else
+                        echo "已跳过，下次 sync 会再次询问。"
+                    fi
+                    break
+                else
+                    # Case 1B: 名字已被注册 — 拒绝重复，防止身份冲突
+                    echo -e "${RED}✗ [$INPUT_NAME] 已被其他设备注册，请选择其他名称。${NC}"
+                    continue
+                fi
+            done
         fi
     else
         # Case 2: .machine-name 存在
@@ -1932,16 +2083,16 @@ else
             if [ "$INTERACTIVE" = false ]; then
                 echo "跳过设备注册（非交互模式）"
             else
-            read -p "是否添加？(y/n) " CONFIRM
-            if [[ "$CONFIRM" =~ ^[Yy] ]]; then
-                if register_handoff_device "$MACHINE_NAME"; then
-                    HANDOFF_READY=1
+                read -p "是否添加？(y/n) " CONFIRM
+                if [[ "$CONFIRM" =~ ^[Yy] ]]; then
+                    if register_handoff_device "$MACHINE_NAME"; then
+                        HANDOFF_READY=1
+                    else
+                        echo -e "${YELLOW}设备注册失败，handoff 功能本次跳过${NC}"
+                    fi
                 else
-                    echo -e "${YELLOW}设备注册失败，handoff 功能本次跳过${NC}"
+                    echo -e "${YELLOW}设备 [$MACHINE_NAME] 未在 handoff 设备列表中，handoff 功能不可用。${NC}"
                 fi
-            else
-                echo -e "${YELLOW}设备 [$MACHINE_NAME] 未在 handoff 设备列表中，handoff 功能不可用。${NC}"
-            fi
             fi
         fi
     fi
@@ -1965,9 +2116,12 @@ else
         echo "HANDOFF: Pending tasks detected"
     fi
 
-    # Summary
-    if [ -z "$ANY_PENDING" ] && { [ $HANDOFF_READY -eq 0 ] || [ -z "${DEVICE_PENDING:-}" ]; }; then
+    # Summary：只有"设备已注册 + ANY 空 + 设备专属空"才算真正"无待办"。
+    # 设备未注册时设备专属任务未被检查，输出"无待办"会误导
+    if [ -z "$ANY_PENDING" ] && [ $HANDOFF_READY -eq 1 ] && [ -z "${DEVICE_PENDING:-}" ]; then
         echo "无待办 handoff 任务。"
+    elif [ -z "$ANY_PENDING" ] && [ $HANDOFF_READY -eq 0 ]; then
+        echo "无 ANY 任务；设备未注册，专属任务未检查。"
     fi
 fi
 
@@ -1977,7 +2131,11 @@ echo "[6/6] 检查 dotfiles 是否需要推送..."
 
 if [ -d "$DOTFILES_DIR" ]; then
     if pushd "$DOTFILES_DIR" >/dev/null; then
-        DOTFILES_STATUS=$(git status --porcelain | grep -v '^\?\? .*\.bak$')
+        # 排除 conflict-resolve 写下的 .bak 备份：sync_commit_push 会用 pathspec
+        # ':!**/*.bak' 跳过它们，但本判断在那之前；不滤掉的话只剩 .bak 时也会进 commit 分支
+        # `tr -d '\r'` 防御 Windows CRLF 环境下 porcelain 输出尾部可能残留 \r，导致
+        # 末尾锚 `\.bak$` 失配
+        DOTFILES_STATUS=$(git status --porcelain | tr -d '\r' | grep -v '^\?\? .*\.bak$')
         if [ -n "$DOTFILES_STATUS" ]; then
             if sync_commit_push "dotfiles"; then
                 echo -e "${GREEN}dotfiles 已提交并推送${NC}"
@@ -1999,7 +2157,7 @@ if [ $HAS_ERROR -ne 0 ]; then
 fi
 
 # --- Repo sync disabled hint ---
-if [ "${ENABLE_REPO_SYNC:-true}" = "false" ]; then
+if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
     HINT_FILE="${SCRIPT_DIR}/.repo_sync_hint_count"
     hint_count=0
     if [ -f "$HINT_FILE" ]; then

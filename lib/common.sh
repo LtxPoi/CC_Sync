@@ -23,7 +23,7 @@ GRAY='\033[90m'
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- GitHub topic 常量 ---
-TOPIC="claude-code-workspace"
+TOPIC="${TOPIC:-claude-code-workspace}"
 
 # --- cygpath 可用性缓存（脚本生命周期内不变）---
 if command -v cygpath &>/dev/null; then
@@ -78,10 +78,17 @@ get_machine_name() {
 
 # --- 计算 CC 项目哈希（绝对路径 → ~/.claude/projects/ 下的目录名）---
 # CC 将路径中的 : \ _ / 全部替换为 -，如 D:\workspace\my-project → D--workspace-my-project
+# WARNING: Must match Claude Code's internal path hashing. If CC changes its scheme,
+# update this function and verify with: ls ~/.claude/projects/
+# 已知碰撞：含下划线和斜杠的不同路径会哈希到同一字符串（例：D:/foo_bar/baz 与
+# D-/foo/bar/baz 都 → D--foo-bar-baz）。无法在不破坏 CC 兼容的前提下规避；
+# sync_memory_dir 的 [ ! -d "$CC_PROJECT_DIR" ] 守卫使错配只表现为静默跳过，
+# 而非误写 —— 但理论上若两个 CC 项目同时 hash 到一致目录，memory 会互相覆盖。
 compute_cc_hash() {
     local p
     p=$(normalize_path "${1%/}")
-    # normalize_path 已将 \ 转为 /，替换 : / _ 三种字符为 -
+    # normalize_path 输出 / 分隔符路径（cygpath -m 模式或手动 /X/... 转换）；
+    # 这里替换 ':', '/', '_' 三种字符为 '-'，与 CC 内部哈希算法一致
     echo "$p" | tr ':/_' '-'
 }
 
