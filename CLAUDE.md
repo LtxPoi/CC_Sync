@@ -37,9 +37,9 @@ When `.env` does not exist:
 
 Example `.env` (created by wizard — values are single-quoted via Python `shlex.quote`):
 ```
-DOTFILES_PATH='/c/Claude_code_cli/dotfiles'
+DOTFILES_PATH='/c/config/dotfiles'
 ENABLE_REPO_SYNC='true'
-WORKSPACE_ROOTS='/c/Claude_code_cli'
+WORKSPACE_ROOTS='/c/workspace'
 ```
 
 The wizard always writes single-quoted form. Older unquoted/double-quoted `.env` files are auto-migrated to this canonical form on every sync run by `_migrate_legacy_env` (with stderr warnings if the old value contained `$` / backtick / multi-token whitespace).
