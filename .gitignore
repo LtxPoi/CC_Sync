@@ -2,6 +2,12 @@
 .env
 .machine-name
 .repo_sync_hint_count
+.sync_state.json
+.sync_state.json.*
+.skill_import_ignore
+
+# Backups created by sync conflict handling
+*.bak
 
 # Python cache
 __pycache__/

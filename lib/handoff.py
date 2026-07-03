@@ -10,19 +10,26 @@ import sys
 
 
 def _ensure_utf8():
-    if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding \
-            and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    # Both streams: warnings (registry mismatch / unclosed fence) go to stderr and
+    # carry non-ASCII (an em-dash); leaving stderr at the cp936 default produces
+    # mojibake in a UTF-8 terminal on Chinese-locale Windows.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and stream.encoding \
+                and stream.encoding.lower() not in ("utf-8", "utf8"):
+            stream.reconfigure(encoding="utf-8")
 
 
 # 模块级编码保护，防止 Windows cp936 环境下中文输出乱码（import 模式也生效）
 _ensure_utf8()
 
 
-# Unicode line-terminator chars beyond \n / \r that Python regex `^` / `$` in
-# MULTILINE mode also recognize. A device name containing any of these would
-# slip past a naive \n / \r-only guard and corrupt section-boundary parsing.
-_LINE_TERMINATORS = re.compile(r"[\n\r\x0b\x0c\x1c-\x1e\x85  ]")
+# Unicode whitespace / line-separator chars beyond \n / \r. We reject these in
+# device names because the header regex `^## (.+?)\s*$` matches them via `\s`
+# (Python `\s` is Unicode-aware), so a crafted name could terminate the captured
+# header early or fabricate a section boundary. (They are NOT recognized by `re`
+# MULTILINE `^`/`$`, which split on `\n` only — the earlier comment named the
+# wrong mechanism.)
+_LINE_TERMINATORS = re.compile("[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 
 
 def _validate_section_name(name):
@@ -40,6 +47,23 @@ def _validate_section_name(name):
         # ',' is the registry list separator; embedding it splits the name on round-trip
         # and the resulting fragments wouldn't match the actual `## Name,...` header.
         raise ValueError("设备名不能包含 ','（registry 用逗号分隔，会破坏解析）")
+    # Markdown rendering safety — a section name containing inline backticks /
+    # brackets / asterisks / pipes survives raw parsing but a markdown preview
+    # of HANDOFF.md (GitHub web UI, code review tools, IDE preview panes)
+    # interprets them as formatting, visually hiding part of the name. Plain
+    # CJK / ASCII identifiers / space / dot / hyphen / underscore are
+    # preserved (Desktop, Laptop-Home, ThinkPad X1 Gen11, work_laptop, 家用笔记本).
+    # `_` is intentionally NOT in the reject set: CommonMark §6.2 says `_` is
+    # not interpreted as emphasis when surrounded by word characters (no
+    # whitespace/punctuation on either side), so `work_laptop` renders as
+    # plain text in any compliant preview — the earlier inclusion of `_`
+    # invalidated common registry entries and disabled detect_hidden_sections
+    # (which returns [] on any registry validation failure).
+    for ch in name:
+        if ch in "`[]*~>|#{}":
+            raise ValueError(
+                f"设备名不能包含 markdown 特殊字符 '{ch}'（在 HANDOFF.md 预览时会被当成格式化字符隐藏部分内容）"
+            )
     if name != name.strip():
         # Leading/trailing whitespace would silently survive in the registry list
         # (after split-and-strip) but mismatch the on-disk `## <name>` line, breaking
@@ -101,12 +125,15 @@ def _has_unclosed_fence(text):
 def _iter_top_level_header_names(text):
     """Yield ## header names from top-level (outside fenced code blocks).
 
-    Returns the captured name without trimming whitespace — `_validate_section_name`
-    rejects leading/trailing whitespace, so a name harvested here is already either
-    well-formed (passes validation) or malformed (caller drops via validator). Not
-    stripping preserves round-trip: harvested name matches the on-disk `## <name>`
-    line exactly so downstream comparisons (e.g., section_exists, registry round-trip)
-    don't desync with reality.
+    Returns the captured name as the regex produced it. The regex
+    `^## (.+?)\\s*$` puts trailing whitespace OUTSIDE the non-greedy capture
+    (so `## Foo Bar   ` yields `Foo Bar`, not `Foo Bar   `); leading
+    whitespace is structurally impossible because of the `^## ` anchor.
+    No additional Python-side `.strip()` is applied — the regex already
+    trimmed both sides. Names then pass through `_validate_section_name`
+    at the caller (which also rejects edge whitespace as a redundant
+    guard) so a name harvested here is either well-formed or dropped by
+    the validator.
     """
     for _, line in _iter_top_level_lines(text.split("\n")):
         m = re.match(r"^## (.+?)\s*$", line)
@@ -178,7 +205,11 @@ def read_registry(text):
     cause adjacent section bodies to merge — exfiltrating one device's tasks
     into another's.
     """
-    m = re.search(r"<!--\s*registry:\s*(.+?)\s*-->", text)
+    # Fence-aware: a <!-- registry: ... --> inside a fenced code block in a task
+    # body must NOT be treated as authoritative (consistent with the header APIs,
+    # which all parse via _iter_top_level_lines). Search only unfenced lines.
+    unfenced = "\n".join(line for _, line in _iter_top_level_lines(text.split("\n")))
+    m = re.search(r"<!--\s*registry:\s*(.+?)\s*-->", unfenced)
     if not m:
         return None
     names = []
@@ -492,14 +523,30 @@ def migrate_format(text):
     must NOT be counted as a real header on either side, otherwise an attacker
     could plant a fenced injection that increments both counts equally and slips
     past the equality check.
+
+    Single-pass over the header iterator splits names into valid and invalid
+    lists, then surfaces the offenders on stderr before bailing — previously
+    the abort was silent and the user had no signal that a malformed header
+    was keeping the file in legacy mode indefinitely.
     """
     if read_registry(text) is not None:
         return text  # Already migrated
-    raw_names = list(_iter_top_level_header_names(text))
-    devices = _extract_all_headers(text)
-    if not devices:
+    devices = []
+    invalid = []
+    for name in _iter_top_level_header_names(text):
+        try:
+            _validate_section_name(name)
+            devices.append(name)
+        except ValueError as err:
+            invalid.append((name, str(err)))
+    if not devices and not invalid:
         return text  # Nothing to migrate
-    if len(devices) != len(raw_names):
+    if invalid:
+        offenders = ", ".join(f"{name!r} ({reason})" for name, reason in invalid)
+        sys.stderr.write(
+            "migrate_format: 跳过 HANDOFF.md registry 迁移；以下 ## 标题未通过验证: "
+            + offenders + "\n"
+        )
         return text  # Refuse to migrate when any name fails validation
     return write_registry(text, devices)
 
@@ -537,7 +584,15 @@ def detect_hidden_sections(text):
     as instruction — it's adversary-controlled data."""
     registry = read_registry(text)
     if registry is None:
-        return []  # legacy / no-registry mode: every `## ` is already a boundary
+        # None covers TWO cases: (a) genuinely absent registry → legacy
+        # mode; (b) a registry comment present but malformed/tampered, which
+        # read_registry rejects to None on purpose (see its docstring) to force
+        # get_pending_tasks onto the header-scan path. Returning [] is safe for
+        # BOTH: in this mode get_pending_tasks treats every `## ` as a real
+        # boundary, so no task is actually hidden and the warning would be
+        # redundant. (The failure mode to guard against is under-parsing names,
+        # not this.)
+        return []
     registry_set = set(registry)
     on_disk = _extract_raw_boundary_headers(text)
     unregistered_set = {n for n in on_disk if n not in registry_set}
@@ -637,9 +692,18 @@ if __name__ == "__main__":
 
     elif cmd == "migrate":
         path = sys.argv[2]
-        text = migrate_format(read_file(path))
+        original = read_file(path)
+        text = migrate_format(original)
         write_file(path, text)
-        print("Migration complete.")
+        # Distinguish actual migration from no-op (already migrated, or
+        # validation aborted with stderr already explaining why). Suppress
+        # the misleading "Migration complete." print when text didn't
+        # change — otherwise users see both the abort warning on stderr
+        # AND a confirmation line on stdout.
+        if text != original:
+            print("Migration complete.")
+        else:
+            print("Migration skipped (already up-to-date, no devices, or invalid headers — see stderr if any).")
 
     elif cmd == "detect_hidden":
         # Output format (display-only): per detected hidden section,
